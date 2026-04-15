@@ -1,0 +1,7 @@
+{
+  "name": "purity_plugin",
+  "module": "pioneerml_purity_plugin",
+  "version": "0.1.0",
+  "description": "PURITY plugin integrating the ATAR+LYSO event reconstruction model stack.",
+  "depends_on": []
+}
