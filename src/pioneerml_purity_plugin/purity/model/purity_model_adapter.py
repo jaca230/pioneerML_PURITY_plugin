@@ -42,6 +42,101 @@ class _PurityExportAdapter(nn.Module):
         return x.new_zeros((0, 1))
 
 
+def _build_trace_example(
+    *,
+    device: torch.device,
+    edge_dim: int,
+    max_graphs: int = 128,
+    max_slices: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Build a broad synthetic batch for trace fallback.
+
+    The core model uses Python `int(...)` conversions on `batch.max()` and `slice_id.max()`.
+    In traced mode, those values become constants, so we intentionally trace with a
+    wide representative batch to avoid shape/index under-allocation at inference time.
+    """
+    rows: list[list[float]] = []
+    batch_ids: list[int] = []
+    for graph_id in range(int(max_graphs)):
+        slice_id = float(graph_id % int(max_slices))
+        t_base = float((graph_id % 10) * 0.05)
+
+        # ATAR XZ hit
+        rows.append(
+            [
+                0.10 + 0.001 * graph_id,  # x
+                0.00,                     # y
+                0.20,                     # z
+                0.30,                     # E
+                t_base,                   # t (normalized)
+                1.0,                      # is_xz
+                0.0,                      # is_yz
+                0.0,                      # is_lyso
+                slice_id,                 # slice_id
+                t_base * 500.0,           # slice_mean_t (raw ns)
+            ]
+        )
+        batch_ids.append(graph_id)
+
+        # ATAR YZ hit
+        rows.append(
+            [
+                0.00,
+                0.12 + 0.001 * graph_id,
+                0.25,
+                0.25,
+                t_base + 0.01,
+                0.0,
+                1.0,
+                0.0,
+                slice_id,
+                (t_base + 0.01) * 500.0,
+            ]
+        )
+        batch_ids.append(graph_id)
+
+        # LYSO hit
+        rows.append(
+            [
+                0.40,
+                0.35,
+                0.30,
+                0.45,
+                t_base + 0.02,
+                0.0,
+                0.0,
+                1.0,
+                slice_id,
+                (t_base + 0.02) * 500.0,
+            ]
+        )
+        batch_ids.append(graph_id)
+
+        # Second LYSO hit (ensures non-empty LYSO intra-slice edges during trace)
+        rows.append(
+            [
+                0.42,
+                0.33,
+                0.32,
+                0.35,
+                t_base + 0.025,
+                0.0,
+                0.0,
+                1.0,
+                slice_id,
+                (t_base + 0.025) * 500.0,
+            ]
+        )
+        batch_ids.append(graph_id)
+
+    example_x = torch.tensor(rows, dtype=torch.float32, device=device)
+    example_edge_index = torch.zeros((2, 0), dtype=torch.long, device=device)
+    example_edge_attr = torch.zeros((0, int(edge_dim)), dtype=torch.float32, device=device)
+    example_batch = torch.tensor(batch_ids, dtype=torch.long, device=device)
+    return example_x, example_edge_index, example_edge_attr, example_batch
+
+
 @ARCHITECTURE_REGISTRY.register("purity")
 @ARCHITECTURE_REGISTRY.register("purity_model")
 class PurityModel(BaseGraphClassifierModel):
@@ -105,16 +200,23 @@ class PurityModel(BaseGraphClassifierModel):
     def forward(
         self,
         data_or_x: Data | torch.Tensor,
+        edge_index: torch.Tensor | None = None,
+        edge_attr: torch.Tensor | None = None,
         batch: torch.Tensor | None = None,
         task_weights: dict[str, float] | None = None,
     ) -> dict[str, Any]:
+        _ = edge_attr
         if isinstance(data_or_x, Data):
             x_node, node_graph_id = self._resolve_batch_input(data_or_x)
             return self.impl(x_node, node_graph_id, task_weights=task_weights)
 
-        if batch is None:
+        resolved_batch: torch.Tensor | None = batch
+        # Support both `(x, batch)` and `(x, edge_index, edge_attr, batch)` call styles.
+        if resolved_batch is None and isinstance(edge_index, torch.Tensor) and edge_index.dim() == 1:
+            resolved_batch = edge_index
+        if resolved_batch is None:
             raise ValueError("PurityModel.forward requires `batch` when called with tensor inputs.")
-        return self.impl(data_or_x, batch, task_weights=task_weights)
+        return self.impl(data_or_x, resolved_batch, task_weights=task_weights)
 
     def forward_tensors(
         self,
@@ -123,6 +225,41 @@ class PurityModel(BaseGraphClassifierModel):
         task_weights: dict[str, float] | None = None,
     ) -> dict[str, Any]:
         return self.impl(x, batch, task_weights=task_weights)
+
+    def _architecture_config(self) -> dict[str, Any]:
+        return {
+            "node_dim": int(self.node_dim),
+            "edge_dim": int(self.edge_dim),
+            "graph_dim": int(self.graph_dim),
+            "hidden": int(self.hidden),
+            "heads": int(self.heads),
+            "layers": int(self.num_blocks),
+            "dropout": float(self.dropout),
+            "num_pdg_classes": int(self.num_pdg_classes),
+        }
+
+    @staticmethod
+    def state_bundle_path_for(model_path: str | Path) -> Path:
+        resolved = Path(model_path).expanduser().resolve()
+        name = resolved.name
+        if name.endswith("_torchscript.pt"):
+            prefix = name[: -len("_torchscript.pt")]
+            return resolved.with_name(f"{prefix}_state_dict.pt")
+        if name.endswith(".pt"):
+            return resolved.with_name(f"{resolved.stem}_state_dict.pt")
+        return resolved.with_name(f"{name}_state_dict.pt")
+
+    def export_state_bundle(self, path: str | Path) -> Path:
+        bundle_path = self.state_bundle_path_for(path)
+        payload = {
+            "format_version": 1,
+            "model_family": "purity",
+            "adapter": self.__class__.__name__,
+            "architecture": self._architecture_config(),
+            "state_dict": {k: v.detach().cpu() for k, v in self.state_dict().items()},
+        }
+        torch.save(payload, str(bundle_path))
+        return bundle_path
 
     @staticmethod
     def extract_event_logits(raw_output: Any) -> torch.Tensor:
@@ -152,19 +289,10 @@ class PurityModel(BaseGraphClassifierModel):
             scripted = torch.jit.script(scriptable)
         except Exception:
             # Fallback for environments where scripting rejects dynamic control flow.
-            example_x = torch.tensor(
-                [
-                    [0.1, 0.0, 0.1, 0.3, 0.0, 1.0, 0.0, 0.0, 0.0, 10.0],
-                    [0.2, 0.0, 0.2, 0.2, 0.1, 1.0, 0.0, 0.0, 1.0, 10.0],
-                    [0.0, 0.1, 0.2, 0.4, 0.2, 0.0, 1.0, 0.0, 0.0, 11.0],
-                    [0.3, 0.2, 0.3, 0.6, 0.3, 0.0, 0.0, 1.0, 1.0, 12.0],
-                ],
-                dtype=torch.float32,
+            example_x, example_edge_index, example_edge_attr, example_batch = _build_trace_example(
                 device=device,
+                edge_dim=int(self.edge_dim),
             )
-            example_edge_index = torch.zeros((2, 0), dtype=torch.long, device=device)
-            example_edge_attr = torch.zeros((0, int(self.edge_dim)), dtype=torch.float32, device=device)
-            example_batch = torch.tensor([0, 0, 1, 1], dtype=torch.long, device=device)
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", category=torch.jit.TracerWarning)
                 warnings.filterwarnings(
@@ -184,5 +312,7 @@ class PurityModel(BaseGraphClassifierModel):
                     check_trace=False,
                 )
         if path is not None:
-            scripted.save(str(path))
+            output_path = Path(path).expanduser().resolve()
+            scripted.save(str(output_path))
+            self.export_state_bundle(output_path)
         return scripted

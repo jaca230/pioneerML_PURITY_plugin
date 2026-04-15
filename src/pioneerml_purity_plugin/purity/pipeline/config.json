@@ -461,10 +461,10 @@
   "inference": {
     "model_handle_builder": {
       "model_handle": {
-        "type": "script",
+        "type": "purity_eager",
         "config": {
           "model_subdir": "purity",
-          "model_type": "torchscript",
+          "model_type": "purity_eager",
           "model_path": null
         }
       }

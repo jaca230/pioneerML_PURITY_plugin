@@ -6,16 +6,17 @@ from .evaluation import (
     plot_purity_staged_loss_curves,
 )
 from .loader import PurityGraphLoader
-from .losses import PurityEventBCELoss, PurityUnifiedLoss
+from .losses import PurityUnifiedLoss
+from .model_handle import PurityEagerModelHandle
 from .model import PurityModel
 from .module import PurityMultiLevelLightningModule
 from .writer import PurityDataWriter
 
 __all__ = [
     "PurityModel",
+    "PurityEagerModelHandle",
     "PurityGraphLoader",
     "PurityDataWriter",
-    "PurityEventBCELoss",
     "PurityUnifiedLoss",
     "PurityMultiLevelLightningModule",
     "PurityMultiLevelEvaluator",

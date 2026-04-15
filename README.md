@@ -6,7 +6,7 @@ What this plugin registers:
 - `architecture`: `purity`
 - `loader`: `purity`
 - `writer`: `purity`
-- `loss`: `purity_event_bce`, `purity_unified` (alias: `purity_multitask`)
+- `loss`: `purity_unified` (alias: `purity_multitask`)
 
 Main package:
 - `plugins/PURITY/src/pioneerml_purity_plugin`
@@ -20,11 +20,9 @@ Pipeline config entrypoint:
 Model code layout:
 - `pioneerml_purity_plugin/purity/model/purity_model_adapter.py` (framework adapter layer)
 - `pioneerml_purity_plugin/purity/model/purity_hybrid_model.py` (core model port from `unified_reco/models.py`)
-- `pioneerml_purity_plugin/purity/model/purity.py` (backward-compatible import shim)
 
 Loss code layout:
 - `pioneerml_purity_plugin/purity/losses/purity_unified_loss.py` (registered Omar-parity multitask loss)
-- `pioneerml_purity_plugin/purity/losses/purity_event_bce_loss.py` (simple event-only BCE alternative)
 - `pioneerml_purity_plugin/purity/losses/utils/unified_training_components.py` (internal loss components ported from `unified_reco/train_utils.py`)
 
 Plugin notebooks:

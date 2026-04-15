@@ -6,8 +6,15 @@ Fuses ATAR (x-z, y-z) and LYSO (3D) hits using a Joint Self-Attention Transforme
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch_geometric.nn import (
+    AttentionalAggregation,
+    JumpingKnowledge,
+    TransformerConv,
+    global_add_pool,
+    global_max_pool,
+    radius_graph,
+)
 from torch_geometric.utils import to_dense_batch
-from torch_geometric.nn import global_max_pool, global_add_pool, AttentionalAggregation
 
 from .utils.constants import (
     NORM_T_LYSO, NORM_E_LYSO, NORM_POS_ATAR,
@@ -39,7 +46,6 @@ def physics_edge_index_batch(x, batch):
     # Combine into a unique integer ID per dense cluster
     cluster_id = batch * 10000 + slice_id * 10 + subsys_id
     
-    from torch_geometric.nn import radius_graph
     dummy_pos = torch.zeros((x.size(0), 1), device=x.device)
     
     with torch.no_grad():
@@ -61,7 +67,6 @@ class JointAttentionBlock(nn.Module):
     def __init__(self, hidden_dim=128, heads=4, edge_dim=11, dropout=0.1):
         super().__init__()
         self.ln1 = nn.LayerNorm(hidden_dim)
-        from torch_geometric.nn import TransformerConv
         self.conv = TransformerConv(
             in_channels=hidden_dim, 
             out_channels=hidden_dim // heads, 
@@ -103,7 +108,7 @@ class VectorHead(nn.Module):
         )
     def forward(self, x):
         raw = self.mlp(x)
-        return F.normalize(raw, p=2, dim=-1)
+        return F.normalize(raw, p=2.0, dim=-1)
 
 class QuantileOutputHead(nn.Module):
     def __init__(self, input_dim, num_points=2, coords=3, quantiles=[0.16, 0.50, 0.84]):
@@ -157,7 +162,8 @@ def build_atar_edge_attr(x, edge_index):
     if edge_index.numel() == 0:
         return torch.zeros((0, 4), dtype=torch.float, device=x.device)
 
-    src, dst = edge_index
+    src = edge_index[0]
+    dst = edge_index[1]
     u, v = x[src], x[dst]
 
     is_yz_u = u[:, 6] > 0.5
@@ -195,7 +201,8 @@ def build_lyso_edge_attr(x, edge_index):
     if edge_index.numel() == 0:
         return torch.zeros((0, 5), dtype=torch.float, device=x.device)
 
-    src, dst = edge_index
+    src = edge_index[0]
+    dst = edge_index[1]
     u, v = x[src], x[dst]
 
     out = v[:, :5] - u[:, :5]  # [dx, dy, dz, dE, dt]
@@ -256,8 +263,6 @@ class PurityHybridModel(nn.Module):
             for _ in range(num_blocks)
         ])
         
-        from torch_geometric.nn import JumpingKnowledge, AttentionalAggregation
-
         # Separate JK per subsystem — ATAR and LYSO representations never share a joint JK
         self.atar_jk = JumpingKnowledge(mode="cat")
         self.lyso_jk = JumpingKnowledge(mode="cat")
@@ -514,7 +519,8 @@ class PurityHybridModel(nn.Module):
 
         # Split edge index by subsystem (ATAR-only and LYSO-only edges are already separate
         # since physics_edge_index_batch uses cluster_id = batch*10000 + slice_id*10 + subsys_id)
-        src, dst = edge_index
+        src = edge_index[0]
+        dst = edge_index[1]
         edge_is_atar = is_atar[src] & is_atar[dst]
         edge_is_lyso = is_lyso[src] & is_lyso[dst]
 
@@ -563,8 +569,6 @@ class PurityHybridModel(nn.Module):
             batch_calo = batch[is_lyso]
             
             batch_size = int(batch.max().item() + 1)
-            from torch_geometric.utils import to_dense_batch
-            
             # Convert to padded dense batches
             h_atar_dense, atar_mask = to_dense_batch(h_atar, batch_atar, batch_size=batch_size)
             h_calo_dense, calo_mask = to_dense_batch(h_calo, batch_calo, batch_size=batch_size)
@@ -677,24 +681,6 @@ class PurityHybridModel(nn.Module):
             has_x = (count_x > 0).squeeze()
             has_y = (count_y > 0).squeeze()
 
-            # Apply PyG AttentionalAggregation per Time Slice with specific Splitter masks
-            def pool_with_soft_mask(pool_layer_x, pool_layer_y, mask_x, mask_y):
-                hx = h_atar_x * mask_x if mask_x is not None else h_atar_x
-                hy = h_atar_y * mask_y if mask_y is not None else h_atar_y
-                
-                px = pool_layer_x(hx, global_slice_idx_x, dim_size=num_global_slices) if has_x.any() else torch.zeros(num_global_slices, jk_dim, device=hx.device)
-                py = pool_layer_y(hy, global_slice_idx_y, dim_size=num_global_slices) if has_y.any() else torch.zeros(num_global_slices, jk_dim, device=hy.device)
-                
-                return px, py
-                
-            def pool_with_hard_mask(pool_layer_x, pool_layer_y, mask_x, mask_y):
-                # Pass the explicit mask array directly to the MaskedAttentionalAggregation
-                # layer so it can selectively drop the softmax gates for background hits.
-                px = pool_layer_x(h_atar_x, global_slice_idx_x, dim_size=num_global_slices, mask=mask_x) if has_x.any() else torch.zeros(num_global_slices, jk_dim, device=h_atar_x.device)
-                py = pool_layer_y(h_atar_y, global_slice_idx_y, dim_size=num_global_slices, mask=mask_y) if has_y.any() else torch.zeros(num_global_slices, jk_dim, device=h_atar_y.device)
-                
-                return px, py
-                
             # Bring back has_x to unsqueezed for math
             has_x_f = has_x.float().unsqueeze(1)
             has_y_f = has_y.float().unsqueeze(1)
@@ -702,9 +688,6 @@ class PurityHybridModel(nn.Module):
             # Combine X and Y 
             valid_slice_mask = ((has_x_f + has_y_f) > 0).squeeze() # Slices that actually have ATAR hits
             output['valid_slice_mask'] = valid_slice_mask
-            
-            def safe_mean(px, py):
-                return ((px * has_x_f) + (py * has_y_f)) / (has_x_f + has_y_f).clamp(min=1.0)
             
             # --- PHASE 1: Evaluate Node-Level Predictions First! ---
             # Node PDG uses the new body+final architecture with late energy injection.
@@ -776,7 +759,10 @@ class PurityHybridModel(nn.Module):
             output['atar_slice_multi'] = self.atar_slice_multi_head(valid_slice_multi_input).squeeze(-1)
             
             # Ortho-Context stereo bridge used for PDG and Downstream (uses weighted mean of views)
-            stereo_multi = safe_mean(pool_x_multi_attn, pool_y_multi_attn)[valid_slice_mask]
+            stereo_multi = (
+                ((pool_x_multi_attn * has_x_f) + (pool_y_multi_attn * has_y_f))
+                / (has_x_f + has_y_f).clamp(min=1.0)
+            )[valid_slice_mask]
             
             valid_pool_x_multi = pool_x_multi_attn[valid_slice_mask]
             valid_pool_y_multi = pool_y_multi_attn[valid_slice_mask]
@@ -894,7 +880,6 @@ class PurityHybridModel(nn.Module):
                 sorted_tokens9 = atar_event_tokens[sort_idx_atar9]
                 sorted_batch9 = B_atar_idx[sort_idx_atar9]
 
-                from torch_geometric.utils import to_dense_batch
                 dense_atar9, pad_mask9 = to_dense_batch(sorted_tokens9, sorted_batch9)
 
                 # Pre-LN: normalize BEFORE attention, not after residual.
@@ -955,7 +940,7 @@ class PurityHybridModel(nn.Module):
             endpoints_det = output['atar_endpoints'].detach()  # [N_valid_slices, 2, 3, 3]
             start_median = endpoints_det[:, 0, :, 1]  # [N_valid_slices, 3]
             stop_median = endpoints_det[:, 1, :, 1]   # [N_valid_slices, 3]
-            slice_exit_dir = F.normalize(stop_median - start_median, p=2, dim=-1)  # [N_valid_slices, 3]
+            slice_exit_dir = F.normalize(stop_median - start_median, p=2.0, dim=-1)  # [N_valid_slices, 3]
 
             # Trigger-weighted average exit direction per graph
             slice_trigger_w = atar_trigger_probs.unsqueeze(-1) if 'atar_trigger_logits' in output \
@@ -1071,8 +1056,6 @@ class PurityHybridModel(nn.Module):
             lyso_batch = batch[is_lyso]                 # [N_lyso]
 
             B = num_graphs_in_batch if is_atar.any() else lyso_batch.max().item() + 1
-
-            from torch_geometric.utils import to_dense_batch
 
             # --- Vectorized Object Condensation ---
             g_coords, mask = to_dense_batch(pred_coords, lyso_batch, batch_size=B) # [B, N_max, 3]
@@ -1466,7 +1449,6 @@ class PurityHybridModel(nn.Module):
             unified_batch = unified_batch[sort_idx]
             original_idx = original_idx[sort_idx]
 
-            from torch_geometric.utils import to_dense_batch
             # Pass batch_size=num_graphs_in_batch explicitly so the dense slot index matches
             # the original graph index even when the last graph in the batch contributes no
             # tokens (without it, B_tf would shrink to batch.max()+1, and downstream indexing
