@@ -32,14 +32,30 @@ class _PurityExportAdapter(nn.Module):
         edge_index: torch.Tensor,
         edge_attr: torch.Tensor,
         batch: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> dict[str, torch.Tensor]:
         _ = edge_index
         _ = edge_attr
         outputs = self.model.forward_tensors(x, batch, task_weights=None)
         logits = outputs.get("unified_event_logits")
-        if isinstance(logits, torch.Tensor):
-            return logits
-        return x.new_zeros((0, 1))
+        if logits is None:
+            logits = x.new_zeros((0, 1))
+
+        token_batch = outputs.get("unified_token_batch")
+        if token_batch is None:
+            token_batch = torch.zeros((int(logits.size(0)),), dtype=torch.long, device=logits.device)
+
+        token_valid = outputs.get("unified_token_valid")
+        if token_valid is None:
+            token_valid = torch.ones((int(logits.size(0)),), dtype=torch.bool, device=logits.device)
+
+        payload: dict[str, torch.Tensor] = {
+            "unified_event_logits": logits,
+            "unified_token_batch": token_batch,
+            "unified_token_valid": token_valid,
+            # Keep "main" for generic writer/model-handle paths that look for a default output.
+            "main": logits,
+        }
+        return payload
 
 
 def _build_trace_example(
@@ -223,7 +239,7 @@ class PurityModel(BaseGraphClassifierModel):
         x: torch.Tensor,
         batch: torch.Tensor,
         task_weights: dict[str, float] | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, torch.Tensor]:
         return self.impl(x, batch, task_weights=task_weights)
 
     def _architecture_config(self) -> dict[str, Any]:

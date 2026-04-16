@@ -6,6 +6,7 @@ Fuses ATAR (x-z, y-z) and LYSO (3D) hits using a Joint Self-Attention Transforme
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Dict, Optional
 from torch_geometric.nn import (
     AttentionalAggregation,
     JumpingKnowledge,
@@ -215,6 +216,15 @@ class PurityHybridModel(nn.Module):
     def __init__(self, hidden_dim=150, num_blocks=3, heads=5,
                  dropout=0.05, num_pdg_classes=3):
         super().__init__()
+        self.norm_t_lyso = float(NORM_T_LYSO)
+        self.norm_e_lyso = float(NORM_E_LYSO)
+        self.norm_pos_atar = float(NORM_POS_ATAR)
+        self.sigma_coinc_ns = float(SIGMA_COINC_NS)
+        self.tof_ns = float(TOF_NS)
+        self.accept_z_min_mm = float(ACCEPT_Z_MIN_MM)
+        self.accept_z_max_mm = float(ACCEPT_Z_MAX_MM)
+        self.accept_xy_max_mm = float(ACCEPT_XY_MAX_MM)
+        self.accept_angle_cos = float(_ACCEPT_ANGLE_COS)
 
         # --- Subsystem-aware encoders with clean, physically-motivated feature sets ---
         #
@@ -474,12 +484,29 @@ class PurityHybridModel(nn.Module):
             nn.Sigmoid()
         )
 
-    def forward(self, x, batch, task_weights=None):
+    @staticmethod
+    def _task_weight(
+        task_weights: Optional[Dict[str, float]],
+        key: str,
+        default: float,
+    ) -> float:
+        if task_weights is None:
+            return float(default)
+        if key in task_weights:
+            return float(task_weights[key])
+        return float(default)
+
+    def forward(self, x, batch, task_weights: Optional[Dict[str, float]] = None):
         """
         x: [N_total_hits, 6] (features + modality_idx)
         batch: [N_total_hits] PyG batch index
         """
-        if task_weights is None: task_weights = {}
+        w_node_pdg = self._task_weight(task_weights, "w_node_pdg", 1.0)
+        w_atar_trigger_slice = self._task_weight(task_weights, "w_atar_trigger_slice", 0.0)
+        w_pion_kinematics = self._task_weight(task_weights, "w_pion_kinematics", 0.0)
+        w_event_builder = self._task_weight(task_weights, "w_event_builder", 0.0)
+        w_positron_angle = self._task_weight(task_weights, "w_positron_angle", 0.0)
+        w_lyso_condensation = self._task_weight(task_weights, "w_lyso_condensation", 1.0)
 
         # 0. Extract modality flags and slice IDs
         # x columns: [pos_x, pos_y, pos_z, energy, time, is_xz, is_yz, is_lyso, slice_id]
@@ -598,9 +625,17 @@ class PurityHybridModel(nn.Module):
                 attn_mask = torch.zeros_like(safe_time_block, dtype=h_atar_dense.dtype)
                 attn_mask[safe_time_block] = float('-inf')
                 attn_mask = attn_mask.repeat_interleave(num_heads, dim=0)  # [B*nhead, N_atar, N_lyso]
+                key_padding_mask = torch.zeros(
+                    calo_mask.size(0),
+                    calo_mask.size(1),
+                    dtype=h_atar_dense.dtype,
+                    device=h_atar_dense.device,
+                )
+                key_padding_mask = key_padding_mask.masked_fill(~calo_mask, float("-inf"))
             else:
                 attn_mask = None
                 all_keys_blocked = None
+                key_padding_mask = ~calo_mask
 
             # Cross attention: ATAR queries Calo (time-gated)
             # Detach key/value so ATAR-head gradients do not back-propagate into
@@ -614,7 +649,7 @@ class PurityHybridModel(nn.Module):
                 query=h_atar_dense,
                 key=h_calo_dense.detach(),
                 value=h_calo_dense.detach(),
-                key_padding_mask=~calo_mask,
+                key_padding_mask=key_padding_mask,
                 attn_mask=attn_mask
             )
 
@@ -645,8 +680,8 @@ class PurityHybridModel(nn.Module):
             
         # We need to map (batch_id, slice_id) into a unique ID so we can pool 
         # distinct slices separately across the batch.
-        num_slices_max = slice_ids_dense.max().item() + 1
-        num_graphs_in_batch = batch.max().item() + 1
+        num_slices_max = int(slice_ids_dense.max().item()) + 1
+        num_graphs_in_batch = int(batch.max().item()) + 1
         
         # unique_slice_id = batch_id * num_slices_max + slice_id
         global_slice_ids = batch * num_slices_max + slice_ids_dense
@@ -655,6 +690,8 @@ class PurityHybridModel(nn.Module):
         count_x = torch.zeros(num_global_slices, 1, device=x.device)
         count_y = torch.zeros(num_global_slices, 1, device=x.device)
         count_lyso = torch.zeros(num_global_slices, 1, device=x.device)
+        valid_slice_mask = torch.zeros(num_global_slices, dtype=torch.bool, device=x.device)
+        global_slice_idx_all = torch.empty((0,), dtype=torch.long, device=x.device)
 
         # === ATAR PREDICTIONS ===
         if is_atar.any():
@@ -693,7 +730,7 @@ class PurityHybridModel(nn.Module):
             # Node PDG uses the new body+final architecture with late energy injection.
             # Each hit gets the total energy of its enclosing time-slice appended at the
             # final layer so the high-dim JK features aren't swamped by a single scalar.
-            if task_weights.get('w_node_pdg', 1.0) > 0.0:
+            if w_node_pdg > 0.0:
                 node_pdg_hidden = self.atar_pdg_body(h_atar)  # [N_atar, hidden//2]
                 # Broadcast per-slice energy to every hit in that slice
                 node_slice_energy = slice_energy[global_slice_idx_all]  # [N_atar, 1]
@@ -824,8 +861,8 @@ class PurityHybridModel(nn.Module):
             # Return meta information to unroll predictions downstream
             output['valid_slice_mask'] = valid_slice_mask
             output['valid_slice_indices'] = torch.nonzero(valid_slice_mask).squeeze(1)
-            output['num_graphs_in_batch'] = num_graphs_in_batch
-            output['num_slices_max'] = num_slices_max
+            output['num_graphs_in_batch'] = torch.tensor(num_graphs_in_batch, dtype=torch.long, device=x.device)
+            output['num_slices_max'] = torch.tensor(num_slices_max, dtype=torch.long, device=x.device)
             
             # --- ATAR Event Builder Early Fusion ---
             # Extract endpoints: [N_slices, 2 (points), 3 (coords), 3 (quantiles)] -> 18 features total
@@ -873,7 +910,8 @@ class PurityHybridModel(nn.Module):
             # === PHASE 9: ATAR-Only Event Building ===
             # Self-attention over ATAR event tokens for cross-slice temporal reasoning,
             # then per-token binary trigger classification.
-            if task_weights.get('w_atar_trigger_slice', 0.0) > 0.0 or task_weights.get('w_pion_kinematics', 0.0) > 0.0 or task_weights.get('w_event_builder', 0.0) > 0.0:
+            atar_trigger_probs = torch.zeros(valid_slice_indices.size(0), device=x.device)
+            if w_atar_trigger_slice > 0.0 or w_pion_kinematics > 0.0 or w_event_builder > 0.0:
                 B_atar_idx = valid_slice_mask.nonzero().squeeze(1) // num_slices_max
 
                 sort_idx_atar9 = torch.argsort(B_atar_idx)
@@ -911,7 +949,7 @@ class PurityHybridModel(nn.Module):
                 output['atar_event_tokens'] = atar_event_tokens
 
             # === PHASE 10: Pion Stop Extraction (per-graph, soft-gated) ===
-            if task_weights.get('w_pion_kinematics', 0.0) > 0.0 and 'atar_trigger_logits' in output:
+            if w_pion_kinematics > 0.0 and 'atar_trigger_logits' in output:
                 # Broadcast trigger probs from valid-slice level to hit level
                 trigger_prob_full = torch.zeros(num_global_slices, device=x.device)
                 trigger_prob_full[valid_slice_mask] = atar_trigger_probs
@@ -954,7 +992,7 @@ class PurityHybridModel(nn.Module):
             exit_dir_sum.index_add_(0, B_slice_idx, weighted_exit)
             exit_weight_sum.index_add_(0, B_slice_idx, slice_trigger_w)
             exit_dir_per_graph = F.normalize(
-                exit_dir_sum / exit_weight_sum.clamp(min=1e-6), p=2, dim=-1
+                exit_dir_sum / exit_weight_sum.clamp(min=1e-6), p=2.0, dim=-1
             )  # [B, 3] unit vector
 
             # Per-graph positron reference time: unweighted mean of normalized
@@ -993,15 +1031,16 @@ class PurityHybridModel(nn.Module):
                     torch.full_like(t_num, NO_POSITRON_TIME),
                 )  # [B] normalized (col 4 is already /NORM_T_ATAR=500)
 
-            if task_weights.get('w_positron_angle', 0.0) > 0.0 and 'atar_trigger_logits' in output:
+            if w_positron_angle > 0.0 and 'atar_trigger_logits' in output:
                 # MIP/positron class prob = column 2 of node PDG sigmoid (DETACHED)
                 mip_class_prob = torch.sigmoid(output['atar_node_pdg'][:, 2]).detach()  # [N_atar]
 
-                # Reuse hit_trigger_prob from Phase 10 if available, otherwise recompute
-                if 'atar_pion_stop' not in output:
-                    trigger_prob_full = torch.zeros(num_global_slices, device=x.device)
-                    trigger_prob_full[valid_slice_mask] = atar_trigger_probs
-                    hit_trigger_prob = trigger_prob_full[global_slice_idx_all]
+                # Recompute trigger-prob broadcast from valid-slice logits.
+                # This matches the Phase 10 construction and keeps TorchScript
+                # control-flow simple (single definition for all branches).
+                trigger_prob_full = torch.zeros(num_global_slices, device=x.device)
+                trigger_prob_full[valid_slice_mask] = atar_trigger_probs
+                hit_trigger_prob = trigger_prob_full[global_slice_idx_all]
 
                 mip_gate = (hit_trigger_prob * mip_class_prob).unsqueeze(-1)  # [N_atar, 1]
 
@@ -1030,7 +1069,7 @@ class PurityHybridModel(nn.Module):
         if is_lyso.any():
             h_lyso = h_out[is_lyso]
 
-            if task_weights.get('w_lyso_condensation', 1.0) > 0.0:
+            if w_lyso_condensation > 0.0:
                 output['lyso_beta'] = self.lyso_beta_head(h_lyso)
                 output['lyso_cluster_coords'] = self.lyso_cluster_coord_head(h_lyso)
                 output['lyso_fractions'] = self.lyso_fraction_head(h_lyso)
@@ -1048,14 +1087,18 @@ class PurityHybridModel(nn.Module):
             
         # === UNIFIED HEADS (Event Builder) ===
         K_LYSO = 5 # Top-K soft clustering parameter
+        lyso_pool_all = torch.empty((0, h_out.size(1)), device=x.device)
+        lyso_event_batch_tensor = torch.empty((0,), dtype=torch.long, device=x.device)
+        lyso_valid_tensor = torch.empty((0,), dtype=torch.bool, device=x.device)
+        lyso_event_tokens = torch.empty((0, self.D_EVENT), device=x.device)
         
         # 1. LYSO Top-K Soft Clustering
-        if (hasattr(self, 'lyso_event_mlp') or hasattr(self, 'lyso_event_proj')) and is_lyso.any() and task_weights.get('w_lyso_condensation', 1.0) > 0.0:
+        if is_lyso.any() and w_lyso_condensation > 0.0:
             pred_coords = output['lyso_cluster_coords'] # [N_lyso, 3]
             pred_beta = output['lyso_beta'].squeeze(-1) # [N_lyso]
             lyso_batch = batch[is_lyso]                 # [N_lyso]
 
-            B = num_graphs_in_batch if is_atar.any() else lyso_batch.max().item() + 1
+            B = num_graphs_in_batch if is_atar.any() else int(lyso_batch.max().item()) + 1
 
             # --- Vectorized Object Condensation ---
             g_coords, mask = to_dense_batch(pred_coords, lyso_batch, batch_size=B) # [B, N_max, 3]
@@ -1069,7 +1112,7 @@ class PurityHybridModel(nn.Module):
             
             g_beta[~mask] = 0.0 # Padded nodes exert 0 priority and 0 affinity
             
-            energy_threshold_norm = 2.0 / NORM_E_LYSO  # 2 MeV threshold
+            energy_threshold_norm = 2.0 / self.norm_e_lyso  # 2 MeV threshold
             is_valid_seed = (g_slice_id > 0) | (g_energy > energy_threshold_norm)
             g_beta_seeds = g_beta * is_valid_seed.float()
             
@@ -1165,13 +1208,13 @@ class PurityHybridModel(nn.Module):
             # Independent of position-magnitude accumulation, so a low-weight hit at one
             # angle can't be confused with a high-weight hit at another. Used for the
             # angular features (sin/cos θ,φ, cos_sep_positron, cos_sep_exit).
-            hit_r = g_phys_pos.norm(dim=-1, keepdim=True).clamp(min=1e-6)       # [B, N_max, 1]
+            hit_r = torch.sqrt((g_phys_pos * g_phys_pos).sum(dim=-1, keepdim=True)).clamp(min=1e-6)  # [B, N_max, 1]
             hit_dir = g_phys_pos / hit_r                                         # [B, N_max, 3]
             hit_dir = hit_dir * mask.unsqueeze(-1).float()
             cluster_dir_raw = torch.bmm(
                 w_norm.transpose(1, 2), hit_dir                                  # [B, actual_k, 3]
             ) / w_sum_safe.unsqueeze(-1)
-            cluster_dir_norm = cluster_dir_raw.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            cluster_dir_norm = torch.sqrt((cluster_dir_raw * cluster_dir_raw).sum(dim=-1, keepdim=True)).clamp(min=1e-6)
             cluster_dir = cluster_dir_raw / cluster_dir_norm                     # unit vector
             cluster_dir = cluster_dir.masked_fill(seed_invalid.unsqueeze(-1), 0.0)
 
@@ -1295,10 +1338,10 @@ class PurityHybridModel(nn.Module):
                 # LYSO inner radius ≈ 15 cm → TOF ≈ 150 mm / 300 mm·ns⁻¹ = 0.5 ns.
                 # Cluster-to-cluster r variation is <<σ=2 ns so a constant TOF is fine
                 # and avoids coupling to cluster_phys_pos magnitude.
-                tof_norm_scalar = TOF_NS / NORM_T_LYSO
+                tof_norm_scalar = self.tof_ns / self.norm_t_lyso
                 tof_flat = torch.full_like(dt_from_pos, tof_norm_scalar)             # [Total_K, 1]
                 dt_corr = dt_from_pos - tof_flat                                    # [Total_K, 1] normalized
-                dt_corr_ns = dt_corr * NORM_T_LYSO                                  # [Total_K, 1] ns
+                dt_corr_ns = dt_corr * self.norm_t_lyso                             # [Total_K, 1] ns
 
                 # === Gaussian coincidence window ===
                 # Peaked at dt_corr=0, σ=2 ns. Physically motivated: the LYSO time resolution
@@ -1308,7 +1351,7 @@ class PurityHybridModel(nn.Module):
                 # and ≈0 everywhere else, matching the "evidence for trigger" semantics,
                 # instead of a linear dt that grows with the *wrong* clusters.
                 coinc_feat = torch.exp(
-                    -(dt_corr_ns ** 2) / (2.0 * SIGMA_COINC_NS ** 2)
+                    -(dt_corr_ns ** 2) / (2.0 * self.sigma_coinc_ns ** 2)
                 )                                                                   # [Total_K, 1]
                 cluster_et_flat = coinc_feat                                        # coincidence window as time feature
 
@@ -1346,7 +1389,7 @@ class PurityHybridModel(nn.Module):
                     beta_flat,            # 1  (OC seed confidence)
                     soft_n_hits_flat,     # 1  (cluster occupancy = Σw)
                 ], dim=-1)  # [Total_K, 9]
-                lyso_cluster_times = cluster_mean_time_padded[has_lyso].view(-1) * NORM_T_LYSO  # [Total_K] raw ns (back from normalized for temporal bias)
+                lyso_cluster_times = cluster_mean_time_padded[has_lyso].view(-1) * self.norm_t_lyso  # [Total_K] raw ns (back from normalized for temporal bias)
                 lyso_cluster_etimes = cluster_energy_time_padded[has_lyso].view(-1)  # [Total_K]
                 lyso_cluster_energies = cluster_e_mean.view(-1).detach()  # [Total_K] normalized cluster E (for attention bias scaling)
                 output['lyso_cluster_energies'] = lyso_cluster_energies
@@ -1397,6 +1440,7 @@ class PurityHybridModel(nn.Module):
         all_valid = []
         all_times = []    # Per-token mean times (raw ns) for temporal attention bias
         all_lyso_E = []   # Per-token LYSO cluster E (normalized); ATAR slots stored as 0
+        unified_num_atar_tokens = 0
 
         if is_atar.any() and 'atar_event_tokens' in output:
             B_atar_idx = valid_slice_mask.nonzero().squeeze(1) // num_slices_max
@@ -1419,7 +1463,8 @@ class PurityHybridModel(nn.Module):
             all_lyso_E.append(torch.zeros_like(atar_token_times))   # ATAR placeholder
             all_batch.append(B_atar_idx)
             all_valid.append(torch.ones(atar_tokens_with_mod.size(0), dtype=torch.bool, device=x.device))
-            output['unified_num_atar_tokens'] = all_tokens[0].size(0)
+            unified_num_atar_tokens = all_tokens[0].size(0)
+            output['unified_num_atar_tokens'] = torch.tensor(unified_num_atar_tokens, dtype=torch.long, device=x.device)
 
         if is_lyso.any() and 'lyso_soft_assignments' in output:
             lyso_tokens_with_mod = lyso_event_tokens + self.event_modality_emb.weight[1]
@@ -1463,11 +1508,27 @@ class PurityHybridModel(nn.Module):
             dense_valid, _ = to_dense_batch(unified_valid, unified_batch, batch_size=num_graphs_in_batch)
 
             # Transformer Forward
-            padding_mask = ~dense_valid
+            # Keep mask dtypes aligned for PyTorch Transformer internals:
+            # both `mask` and `src_key_padding_mask` are additive float masks.
+            padding_mask_bool = ~dense_valid
+            padding_mask = torch.zeros(
+                dense_valid.size(0),
+                dense_valid.size(1),
+                dtype=dense_tokens.dtype,
+                device=x.device,
+            )
+            padding_mask = padding_mask.masked_fill(padding_mask_bool, float("-inf"))
 
             # === PHASE 15: Directional + Temporal Attention Bias ===
-            src_mask = None
-            n_atar_flat = output.get('unified_num_atar_tokens', 0)
+            # TorchScript requires static types across branches, so keep this as
+            # a tensor throughout (zero means "no additive attention bias").
+            src_mask = torch.zeros(
+                dense_tokens.size(0),
+                dense_tokens.size(1),
+                dense_tokens.size(1),
+                device=x.device,
+            )
+            n_atar_flat = unified_num_atar_tokens
             has_lyso_seeds = 'lyso_seed_coords' in output and is_lyso.any()
 
             # Build per-token modality flags (needed for temporal + directional bias)
@@ -1486,6 +1547,11 @@ class PurityHybridModel(nn.Module):
             # Temporal bias: Gaussian with physics-aware time-of-flight offset
             # Same modality (ATAR↔ATAR, LYSO↔LYSO): expect dt ≈ 0
             # Cross modality: LYSO arrives ~TOF_NS after ATAR
+            dense_lyso_E = torch.zeros(
+                dense_tokens.size(0),
+                dense_tokens.size(1),
+                device=x.device,
+            )
             if len(all_times) > 0:
                 unified_times = torch.cat(all_times, dim=0)
                 sorted_times = unified_times[sort_idx]
@@ -1501,7 +1567,7 @@ class PurityHybridModel(nn.Module):
                 # Cross-modality offset: (mod_j - mod_i) = +1 when i=ATAR,j=LYSO; -1 when reverse; 0 same
                 mod_i = dense_modality.unsqueeze(2)  # [B, T, 1]
                 mod_j = dense_modality.unsqueeze(1)  # [B, 1, T]
-                expected_dt = (mod_j - mod_i).float() * TOF_NS  # [B, T, T]
+                expected_dt = (mod_j - mod_i).float() * self.tof_ns  # [B, T, T]
 
                 # Per-token σ: ATAR = constant MIP-timing scale; LYSO = floor + scale/√E.
                 # Pair σ² = σ_i² + σ_j² (independent errors add in quadrature).
@@ -1526,9 +1592,6 @@ class PurityHybridModel(nn.Module):
                 T = dense_tokens.size(1)
                 B_tf = dense_tokens.size(0)
                 K_LYSO_dim = lyso_seed_coords.size(1)
-
-                if src_mask is None:
-                    src_mask = torch.zeros(B_tf, T, T, device=x.device)
 
                 is_atar_tok_mat = (dense_modality == 0) & dense_valid   # [B, T]
                 is_lyso_tok_mat = (dense_modality == 1) & dense_valid   # [B, T]
@@ -1559,7 +1622,7 @@ class PurityHybridModel(nn.Module):
                 # when padded slots leave delta_cluster exactly zero.
                 pion_stop_phys = pion_stop_pred.detach() * 0.1                         # [B, 3]
                 delta_cluster = (lyso_seed_coords - pion_stop_phys.unsqueeze(1)).detach()  # [B, K, 3]
-                delta_norm = delta_cluster.norm(dim=-1, keepdim=True).clamp(min=1e-3)  # [B, K, 1]
+                delta_norm = torch.sqrt((delta_cluster * delta_cluster).sum(dim=-1, keepdim=True)).clamp(min=1e-3)  # [B, K, 1]
                 cluster_dir = delta_cluster / delta_norm                               # [B, K, 3]
 
                 # ATAR↔LYSO directional bias: cos(positron_dir, dir_to_cluster) / σ_angle(E).
@@ -1567,7 +1630,7 @@ class PurityHybridModel(nn.Module):
                 # so high-E clusters get sharper bias, low-E clusters get weaker bias.
                 if n_atar_flat > 0:
                     pd = positron_dir.detach()
-                    pos_dir_norm = pd / pd.norm(dim=-1, keepdim=True).clamp(min=1e-3)  # [B, 3]
+                    pos_dir_norm = pd / torch.sqrt((pd * pd).sum(dim=-1, keepdim=True)).clamp(min=1e-3)  # [B, 3]
                     cos_align = (cluster_dir * pos_dir_norm.unsqueeze(1)).sum(dim=-1)  # [B, K]
 
                     # Per-cluster E via slot-match from dense_lyso_E [B, T] → [B, K].
@@ -1603,12 +1666,11 @@ class PurityHybridModel(nn.Module):
                 #     src_mask = src_mask + lyso_pair_mat
 
             # TransformerEncoder expects mask as [T,T] or [B*nhead, T, T]
-            if src_mask is not None:
-                nhead = 2  # Must match slim TransformerEncoderLayer nhead
-                # Expand [B, T, T] -> [B*nhead, T, T]
-                src_mask_expanded = src_mask.unsqueeze(1).expand(-1, nhead, -1, -1).reshape(-1, src_mask.size(1), src_mask.size(2))
-            else:
-                src_mask_expanded = None
+            nhead = 2  # Must match slim TransformerEncoderLayer nhead
+            # Expand [B, T, T] -> [B*nhead, T, T]
+            src_mask_expanded = src_mask.unsqueeze(1).expand(-1, nhead, -1, -1).reshape(
+                -1, src_mask.size(1), src_mask.size(2)
+            )
 
             transformed_tokens = self.slim_event_transformer(
                 dense_tokens,
@@ -1625,7 +1687,7 @@ class PurityHybridModel(nn.Module):
             flat_transformed = flat_transformed[inverse_sort]
 
             # Classifier: project transformer 32D → 8D, concat [coinc_feat, cos_sep] → Linear(10, 1)
-            n_atar_tok = output.get('unified_num_atar_tokens', 0)
+            n_atar_tok = unified_num_atar_tokens
             coinc_skip_in = output.get('lyso_coinc_skip_input')  # [Total_K, 2]
             projected = self.event_head_proj(flat_transformed)  # [total_tokens, 8]
             phys_feat = torch.zeros(projected.size(0), 2, device=projected.device)
@@ -1681,7 +1743,7 @@ class PurityHybridModel(nn.Module):
         w_lyso = output.get('lyso_soft_assignments')
         beta_lyso = output.get('lyso_seed_beta')
         ev_logits = output.get('unified_event_logits')
-        n_atar_tok = output.get('unified_num_atar_tokens', 0)
+        n_atar_tok = unified_num_atar_tokens
         if (is_lyso.any() and w_lyso is not None and beta_lyso is not None
                 and ev_logits is not None):
             K = w_lyso.size(1)
@@ -1710,21 +1772,22 @@ class PurityHybridModel(nn.Module):
             pos_energy = torch.full((B,), SENTINEL, device=device)
 
         # Acceptance decision based on predicted quantities.
-        ps_raw = pion_stop * NORM_POS_ATAR
+        ps_raw = pion_stop * self.norm_pos_atar
         fiducial = (
-            (ps_raw[:, 2] > ACCEPT_Z_MIN_MM) & (ps_raw[:, 2] < ACCEPT_Z_MAX_MM) &
-            (ps_raw[:, 0].abs() < ACCEPT_XY_MAX_MM) & (ps_raw[:, 1].abs() < ACCEPT_XY_MAX_MM)
+            (ps_raw[:, 2] > self.accept_z_min_mm) & (ps_raw[:, 2] < self.accept_z_max_mm) &
+            (ps_raw[:, 0].abs() < self.accept_xy_max_mm) & (ps_raw[:, 1].abs() < self.accept_xy_max_mm)
         )
-        angle_ok = positron_dir[:, 2] > _ACCEPT_ANGLE_COS
+        angle_ok = positron_dir[:, 2] > self.accept_angle_cos
         accepted = (fiducial & angle_ok).float()
 
-        output['event_summary'] = {
-            'pion_stop': pion_stop.detach(),
-            'positron_dir': positron_dir.detach(),
-            'positron_polar_angle': polar_angle.detach(),
-            'positron_time': pos_time.detach(),
-            'positron_energy': pos_energy.detach(),
-            'accepted': accepted.detach(),
-        }
+        if not torch.jit.is_scripting():
+            output['event_summary'] = {
+                'pion_stop': pion_stop.detach(),
+                'positron_dir': positron_dir.detach(),
+                'positron_polar_angle': polar_angle.detach(),
+                'positron_time': pos_time.detach(),
+                'positron_energy': pos_energy.detach(),
+                'accepted': accepted.detach(),
+            }
 
         return output

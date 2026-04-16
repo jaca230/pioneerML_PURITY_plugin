@@ -318,6 +318,8 @@ def event_builder_loss(outputs, batch, w_floor=0.05):
         lyso_batch = batch.batch[is_lyso]
         num_graphs_in_batch = outputs.get(
             'num_graphs_in_batch', batch.batch.max().item() + 1)
+        if torch.is_tensor(num_graphs_in_batch):
+            num_graphs_in_batch = int(num_graphs_in_batch.item())
 
         # --- Map graph IDs to contiguous LYSO-graph indices ---
         graph_has_lyso = torch.zeros(num_graphs_in_batch, dtype=torch.bool,
@@ -545,6 +547,8 @@ class PURITYLoss(nn.Module):
             
             # models.py embeds the batch graph count natively into the output dictionary for loss loops
             num_graphs = outputs.get('num_graphs_in_batch', 1)
+            if torch.is_tensor(num_graphs):
+                num_graphs = int(num_graphs.item())
             
             # Execute the Condensation Loss
             l_cond, cond_breakdown = self.condensation(
