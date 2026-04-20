@@ -30,6 +30,9 @@ class PurityUnifiedLoss(BaseLoss):
         "w_lyso_condensation": 0.25,
         "w_positron_energy": 0.0,
         "w_event_builder": 0.0,
+        # Fail fast on non-finite tensors so we can diagnose root-cause data
+        # or model issues instead of masking them.
+        "strict_finite_checks": True,
     }
 
     def __init__(self, **config: Any):

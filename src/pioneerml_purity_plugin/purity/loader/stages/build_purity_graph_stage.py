@@ -44,6 +44,7 @@ class BuildPurityGraphStage(BaseStage):
         "atar_slice_stop_target_out",
         "atar_angle_target_out",
         "atar_pion_stop_target_out",
+        "atar_pion_stop_valid_target_out",
         "positron_initial_energy_target_out",
         "lyso_fracs_target_out",
         "lyso_payload_target_out",
@@ -414,6 +415,29 @@ class BuildPurityGraphStage(BaseStage):
             state["has_trigger_positron_out"] = np.zeros((0,), dtype=np.float32)
             return
 
+        def ensure_row_offsets(offsets: np.ndarray) -> np.ndarray:
+            """
+            Ensure list offsets are compatible with row-wise slicing.
+
+            We occasionally receive optional list columns as missing, which maps to
+            offsets shape (1,) from _list_values_or_empty. For per-row slicing we
+            need shape (n_rows + 1), so synthesize an all-zero offsets vector.
+            """
+            off = np.asarray(offsets, dtype=np.int64)
+            expected = int(n_rows) + 1
+            if expected <= 1:
+                return np.zeros((1,), dtype=np.int64)
+            if int(off.ndim) != 1 or int(off.shape[0]) == 0:
+                return np.zeros((expected,), dtype=np.int64)
+            if int(off.shape[0]) == expected:
+                return off
+            if int(off.shape[0]) == 1:
+                return np.zeros((expected,), dtype=np.int64)
+            if int(off.shape[0]) > expected:
+                return off[:expected]
+            pad = np.full((expected - int(off.shape[0]),), int(off[-1]), dtype=np.int64)
+            return np.concatenate([off, pad], axis=0)
+
         atar_x_vals, atar_x_off = self._list_values_or_empty(store=chunk_in, field="atar_x", dtype=np.float32)
         atar_y_vals, atar_y_off = self._list_values_or_empty(store=chunk_in, field="atar_y", dtype=np.float32)
         atar_z_vals, atar_z_off = self._list_values_or_empty(store=chunk_in, field="atar_z", dtype=np.float32)
@@ -480,6 +504,28 @@ class BuildPurityGraphStage(BaseStage):
         if int(lyso_origin_off[-1]) == 0 and int(lyso_x_off[-1]) > 0:
             lyso_origin_vals, lyso_origin_off = self._zeros_for_offsets(ref_offsets=lyso_x_off, dtype=np.int64)
 
+        # Normalize all list offsets to n_rows+1 so _row_slice is safe for optional
+        # columns that are missing and represented with shape (1,) offsets.
+        atar_x_off = ensure_row_offsets(atar_x_off)
+        atar_y_off = ensure_row_offsets(atar_y_off)
+        atar_z_off = ensure_row_offsets(atar_z_off)
+        atar_e_off = ensure_row_offsets(atar_e_off)
+        atar_t_off = ensure_row_offsets(atar_t_off)
+        atar_view_off = ensure_row_offsets(atar_view_off)
+        atar_slice_off = ensure_row_offsets(atar_slice_off)
+        atar_slice_mean_t_off = ensure_row_offsets(atar_slice_mean_t_off)
+        lyso_x_off = ensure_row_offsets(lyso_x_off)
+        lyso_y_off = ensure_row_offsets(lyso_y_off)
+        lyso_z_off = ensure_row_offsets(lyso_z_off)
+        lyso_e_off = ensure_row_offsets(lyso_e_off)
+        lyso_t_off = ensure_row_offsets(lyso_t_off)
+        lyso_slice_off = ensure_row_offsets(lyso_slice_off)
+        lyso_slice_mean_t_off = ensure_row_offsets(lyso_slice_mean_t_off)
+        atar_pdg_off = ensure_row_offsets(atar_pdg_off)
+        atar_origin_off = ensure_row_offsets(atar_origin_off)
+        atar_truth_t_off = ensure_row_offsets(atar_truth_t_off)
+        lyso_origin_off = ensure_row_offsets(lyso_origin_off)
+
         include_targets = bool(getattr(owner, "include_targets", False))
         if include_targets and target_signal is None and target_energy is None:
             raise RuntimeError(
@@ -525,6 +571,7 @@ class BuildPurityGraphStage(BaseStage):
         atar_slice_stop_target_rows: list[np.ndarray] = []
         atar_angle_target_rows: list[np.ndarray] = []
         atar_pion_stop_target_rows: list[np.ndarray] = []
+        atar_pion_stop_valid_target_rows: list[np.ndarray] = []
         lyso_payload_target_rows: list[np.ndarray] = []
         lyso_mask_target_rows: list[np.ndarray] = []
         positron_energy_target_rows: list[np.ndarray] = []
@@ -852,9 +899,23 @@ class BuildPurityGraphStage(BaseStage):
                     dtype=np.float32,
                 ).reshape(1, 3)
                 pion_stop_xyz /= self.atar_pos_norm
+                pion_stop_valid = bool(
+                    truth_pion_stop_x is not None
+                    and truth_pion_stop_y is not None
+                    and truth_pion_stop_z is not None
+                    and int(truth_pion_stop_x.shape[0]) > int(row_idx)
+                    and int(truth_pion_stop_y.shape[0]) > int(row_idx)
+                    and int(truth_pion_stop_z.shape[0]) > int(row_idx)
+                    and np.isfinite(float(truth_pion_stop_x[row_idx]))
+                    and np.isfinite(float(truth_pion_stop_y[row_idx]))
+                    and np.isfinite(float(truth_pion_stop_z[row_idx]))
+                )
                 for _ in range(n_atar_slices):
                     atar_angle_target_rows.append(angle_xyz.copy())
                     atar_pion_stop_target_rows.append(pion_stop_xyz.copy())
+                    atar_pion_stop_valid_target_rows.append(
+                        np.asarray([1.0 if pion_stop_valid else 0.0], dtype=np.float32)
+                    )
             graph_atar_slice_counts.append(n_atar_slices)
 
             if include_targets:
@@ -1010,6 +1071,13 @@ class BuildPurityGraphStage(BaseStage):
             )
         else:
             state["atar_pion_stop_target_out"] = np.zeros((0, 3), dtype=np.float32)
+        if atar_pion_stop_valid_target_rows:
+            state["atar_pion_stop_valid_target_out"] = np.concatenate(
+                atar_pion_stop_valid_target_rows,
+                axis=0,
+            ).astype(np.float32, copy=False)
+        else:
+            state["atar_pion_stop_valid_target_out"] = np.zeros((0,), dtype=np.float32)
 
         if positron_energy_target_rows:
             state["positron_initial_energy_target_out"] = np.stack(positron_energy_target_rows, axis=0).astype(

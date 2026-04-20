@@ -243,7 +243,7 @@ class CondensationLoss(nn.Module):
 
 
 
-def event_builder_loss(outputs, batch, w_floor=0.05):
+def event_builder_loss(outputs, batch, w_floor=0.05, strict_checks: bool = True):
     """
     Event-level trigger classification loss.
     LYSO: assignment-weighted mixture per hit, then BCE, with per-graph
@@ -255,16 +255,73 @@ def event_builder_loss(outputs, batch, w_floor=0.05):
              0.05 keeps a small gradient so the skip connection still
              learns to be cautious when pt is fake).
     """
+    def _tensor_stats(name: str, t: torch.Tensor) -> str:
+        if t is None:
+            return f"{name}:<none>"
+        flat = t.detach().reshape(-1)
+        if flat.numel() == 0:
+            return f"{name}:numel=0"
+        finite = torch.isfinite(flat)
+        finite_count = int(finite.sum().item())
+        nan_count = int(torch.isnan(flat).sum().item())
+        inf_count = int(torch.isinf(flat).sum().item())
+        if finite_count > 0:
+            finite_vals = flat[finite]
+            min_v = float(finite_vals.min().item())
+            max_v = float(finite_vals.max().item())
+        else:
+            min_v = float("nan")
+            max_v = float("nan")
+        return (
+            f"{name}:shape={tuple(t.shape)} numel={int(flat.numel())} "
+            f"finite={finite_count} nan={nan_count} inf={inf_count} "
+            f"min={min_v:.6g} max={max_v:.6g}"
+        )
+
+    def _validate_bce_inputs(*, probs: torch.Tensor, targets: torch.Tensor, context: str) -> None:
+        if probs.numel() == 0 or targets.numel() == 0:
+            return
+        probs_flat = probs.detach().reshape(-1)
+        targets_flat = targets.detach().reshape(-1)
+        probs_invalid = (
+            (not bool(torch.isfinite(probs_flat).all().item()))
+            or bool((probs_flat < 0.0).any().item())
+            or bool((probs_flat > 1.0).any().item())
+        )
+        targets_invalid = (
+            (not bool(torch.isfinite(targets_flat).all().item()))
+            or bool((targets_flat < 0.0).any().item())
+            or bool((targets_flat > 1.0).any().item())
+        )
+        if probs_invalid or targets_invalid:
+            raise RuntimeError(
+                "[event_builder_loss] invalid BCE inputs detected before binary_cross_entropy "
+                f"in {context}.\n"
+                + _tensor_stats("probs", probs_flat)
+                + "\n"
+                + _tensor_stats("targets", targets_flat)
+            )
+
     event_logits = outputs.get('unified_event_logits')
     if event_logits is None:
         return torch.tensor(0.0, device=batch.x.device, requires_grad=True)
+    if not bool(torch.isfinite(event_logits).all().item()):
+        raise RuntimeError(
+            "[event_builder_loss] unified_event_logits has non-finite values.\n"
+            + _tensor_stats("unified_event_logits", event_logits)
+        )
 
     energy = batch.x[:, 3]
     is_atar = (batch.x[:, 5] > 0.5) | (batch.x[:, 6] > 0.5)
     is_lyso = (batch.x[:, 7] > 0.5)
     trigger_targets = batch.is_trigger_target
     num_atar_tokens = outputs.get('unified_num_atar_tokens', 0)
+    if torch.is_tensor(num_atar_tokens):
+        num_atar_tokens = int(num_atar_tokens.item())
+    else:
+        num_atar_tokens = int(num_atar_tokens)
     p_tokens = torch.sigmoid(event_logits.squeeze(-1))
+    num_atar_tokens = max(0, min(num_atar_tokens, int(p_tokens.shape[0])))
 
     atar_loss_sum = torch.tensor(0.0, device=batch.x.device)
     lyso_loss_sum = torch.tensor(0.0, device=batch.x.device)
@@ -281,7 +338,13 @@ def event_builder_loss(outputs, batch, w_floor=0.05):
 
         valid_slice_mask = outputs['valid_slice_mask']
         num_slices_max = outputs['num_slices_max']
+        if torch.is_tensor(num_slices_max):
+            num_slices_max = int(num_slices_max.item())
+        else:
+            num_slices_max = int(num_slices_max)
         global_slice_ids = batch.batch[is_atar] * num_slices_max + batch.x[is_atar, 8].long()
+        if int(valid_slice_mask.numel()) > 0 and int(global_slice_ids.numel()) > 0:
+            global_slice_ids = global_slice_ids.clamp(min=0, max=int(valid_slice_mask.shape[0]) - 1)
         hit_is_valid = valid_slice_mask[global_slice_ids]
         mapped_slice_indices = torch.cumsum(valid_slice_mask.long(), dim=0) - 1
         idx_in_valid = mapped_slice_indices[global_slice_ids[hit_is_valid]]
@@ -290,8 +353,14 @@ def event_builder_loss(outputs, batch, w_floor=0.05):
         atar_targets_valid = atar_targets[hit_is_valid]
         atar_energy_valid = atar_energy[hit_is_valid]
 
+        p_atar_clamped = p_atar_broadcast.clamp(1e-6, 1-1e-6)
+        _validate_bce_inputs(
+            probs=p_atar_clamped,
+            targets=atar_targets_valid,
+            context="atar_branch",
+        )
         bce_atar = F.binary_cross_entropy(
-            p_atar_broadcast.clamp(1e-6, 1-1e-6), atar_targets_valid, reduction='none')
+            p_atar_clamped, atar_targets_valid, reduction='none')
         weighted_loss_atar = bce_atar * atar_energy_valid
 
         num_valid_slices = num_atar_tokens
@@ -311,6 +380,12 @@ def event_builder_loss(outputs, batch, w_floor=0.05):
     if is_lyso.any() and lyso_assignments is not None:
         p_lyso = p_tokens[num_atar_tokens:]
         K = lyso_assignments.size(1)
+        if int(K) <= 0:
+            return torch.tensor(0.0, device=event_logits.device, requires_grad=True)
+        usable = (int(p_lyso.numel()) // int(K)) * int(K)
+        if usable <= 0:
+            return torch.tensor(0.0, device=event_logits.device, requires_grad=True)
+        p_lyso = p_lyso[:usable]
         p_lyso_matrix = p_lyso.view(-1, K)
 
         lyso_energy = energy[is_lyso]
@@ -328,6 +403,8 @@ def event_builder_loss(outputs, batch, w_floor=0.05):
         mapped_graph_indices = torch.cumsum(graph_has_lyso.long(), dim=0) - 1
         lyso_mapped_batch = mapped_graph_indices[lyso_batch]
         lyso_graph_ids = torch.nonzero(graph_has_lyso, as_tuple=False).squeeze(1)  # [n_lyso_graphs]
+        if int(p_lyso_matrix.size(0)) > 0 and int(lyso_mapped_batch.numel()) > 0:
+            lyso_mapped_batch = lyso_mapped_batch.clamp(min=0, max=int(p_lyso_matrix.size(0)) - 1)
 
         # --- Broadcast K cluster probs to each hit ---
         p_lyso_broadcast = p_lyso_matrix[lyso_mapped_batch]
@@ -347,8 +424,14 @@ def event_builder_loss(outputs, batch, w_floor=0.05):
         p_hit = (effective_weights * p_lyso_broadcast).sum(dim=1) / w_sum
 
         # --- Per-hit BCE with class weighting ---
+        p_hit_clamped = p_hit.clamp(1e-6, 1-1e-6)
+        _validate_bce_inputs(
+            probs=p_hit_clamped,
+            targets=lyso_targets,
+            context="lyso_branch",
+        )
         bce_per_hit = F.binary_cross_entropy(
-            p_hit.clamp(1e-6, 1-1e-6), lyso_targets, reduction='none')
+            p_hit_clamped, lyso_targets, reduction='none')
         pos_weight = 3.0
         class_weight = torch.where(lyso_targets > 0.5, pos_weight, 1.0)
         bce_per_hit = bce_per_hit * class_weight
@@ -406,6 +489,11 @@ def event_builder_loss(outputs, batch, w_floor=0.05):
     else:
         event_loss = torch.tensor(0.0, device=event_logits.device, requires_grad=True)
 
+    if not bool(torch.isfinite(event_loss).all().item()):
+        raise RuntimeError(
+            "[event_builder_loss] computed non-finite event loss.\n"
+            + _tensor_stats("event_loss", event_loss)
+        )
     return event_loss
 
 
@@ -426,21 +514,65 @@ class PURITYLoss(nn.Module):
     def forward(self, outputs, targets, batch=None):
         loss_dict = {}
         total_loss = 0.0
+        strict_finite_checks = bool(self.config.get("strict_finite_checks", True))
+
+        def _require_finite_tensor(name: str, t: torch.Tensor) -> None:
+            if not torch.is_tensor(t):
+                return
+            if bool(torch.isfinite(t).all().item()):
+                return
+            flat = t.detach().reshape(-1)
+            finite = torch.isfinite(flat)
+            finite_count = int(finite.sum().item())
+            nan_count = int(torch.isnan(flat).sum().item())
+            inf_count = int(torch.isinf(flat).sum().item())
+            min_v = float(flat[finite].min().item()) if finite_count > 0 else float("nan")
+            max_v = float(flat[finite].max().item()) if finite_count > 0 else float("nan")
+            raise RuntimeError(
+                f"[purity_loss] {name} has non-finite values. "
+                f"shape={tuple(t.shape)} numel={int(flat.numel())} "
+                f"finite={finite_count} nan={nan_count} inf={inf_count} "
+                f"min={min_v:.6g} max={max_v:.6g}"
+            )
+
+        def _require_binary_target(name: str, t: torch.Tensor) -> None:
+            _require_finite_tensor(name, t)
+            if int(t.numel()) <= 0:
+                return
+            bad_low = bool((t < 0.0).any().item())
+            bad_high = bool((t > 1.0).any().item())
+            if bad_low or bad_high:
+                raise RuntimeError(
+                    f"[purity_loss] {name} must be in [0,1] for BCE. "
+                    f"min={float(t.min().item()):.6g} max={float(t.max().item()):.6g}"
+                )
+
+        def _has_elements(*tensors: torch.Tensor) -> bool:
+            for t in tensors:
+                if t is None:
+                    return False
+                if int(t.numel()) <= 0:
+                    return False
+            return True
 
         # 0.  Multi-Event Slice Classifier
         w_multi = self.config.get('w_atar_slice_multi', 0.0)
         if w_multi > 0.0 and 'atar_slice_multi' in outputs and 'atar_slice_multi_target' in targets:
-            # Compute binary cross entropy for the slice-level pileup flag
-            l_multi = self.bce_logits(outputs['atar_slice_multi'], targets['atar_slice_multi_target'])
-            loss_dict['loss_slice_multi'] = l_multi
-            total_loss += w_multi * l_multi
+            if _has_elements(outputs['atar_slice_multi'], targets['atar_slice_multi_target']):
+                # Compute binary cross entropy for the slice-level pileup flag
+                l_multi = self.bce_logits(outputs['atar_slice_multi'], targets['atar_slice_multi_target'])
+                loss_dict['loss_slice_multi'] = l_multi
+                total_loss += w_multi * l_multi
         
         # 1. Node PDG Splitter
         w_node = self.config.get('w_node_pdg', 0.0)
         if w_node > 0.0 and 'atar_node_pdg' in outputs and 'tar_node_pdg' in targets:
-            l_node = self.bce_logits(outputs['atar_node_pdg'], targets['tar_node_pdg'])
-            loss_dict['loss_node_pdg'] = l_node
-            total_loss += w_node * l_node
+            if _has_elements(outputs['atar_node_pdg'], targets['tar_node_pdg']):
+                _require_finite_tensor("atar_node_pdg_logits", outputs['atar_node_pdg'])
+                _require_binary_target("tar_node_pdg", targets['tar_node_pdg'])
+                l_node = self.bce_logits(outputs['atar_node_pdg'], targets['tar_node_pdg'])
+                loss_dict['loss_node_pdg'] = l_node
+                total_loss += w_node * l_node
 
         # Triggering node classifier
         w_trigger = self.config.get('w_node_trigger', 0.0)
@@ -449,32 +581,44 @@ class PURITYLoss(nn.Module):
             is_atar = (batch.x[:, 5] > 0.5) | (batch.x[:, 6] > 0.5)
             
             # 2. Extract those corresponding labels for the BCE calculation!
-            l_atar_trigger = self.bce_logits(outputs['atar_hit_trigger'], targets['is_trigger'][is_atar])
-            
-            total_loss += w_trigger * l_atar_trigger
-            loss_dict['loss_atar_hit_trigger'] = l_atar_trigger
+            trigger_targets = targets['is_trigger'][is_atar]
+            if _has_elements(outputs['atar_hit_trigger'], trigger_targets):
+                l_atar_trigger = self.bce_logits(outputs['atar_hit_trigger'], trigger_targets)
+                total_loss += w_trigger * l_atar_trigger
+                loss_dict['loss_atar_hit_trigger'] = l_atar_trigger
             
         # 2. Slice Group Classifiers
         # FIX: Removed the [valid_batch_idx] scrambling. PyG already aligns this!
         w_slice = self.config.get('w_slice_pdg', 0.0)
         if w_slice > 0.0 and 'atar_slice_pdg' in outputs and 'tar_slice_pdg' in targets:
-            l_slice = self.bce_logits(outputs['atar_slice_pdg'], targets['tar_slice_pdg'])
-            loss_dict['loss_slice_pdg'] = l_slice
-            total_loss += w_slice * l_slice
+            if _has_elements(outputs['atar_slice_pdg'], targets['tar_slice_pdg']):
+                l_slice = self.bce_logits(outputs['atar_slice_pdg'], targets['tar_slice_pdg'])
+                loss_dict['loss_slice_pdg'] = l_slice
+                total_loss += w_slice * l_slice
             
         # 3. ATAR Trigger Slice Loss (Phase 9)
         w_trigger_slice = self.config.get('w_atar_trigger_slice', 0.0)
         if w_trigger_slice > 0.0 and 'atar_trigger_logits' in outputs and 'tar_slice_trigger' in targets:
-            l_trigger_slice = self.bce_logits(outputs['atar_trigger_logits'], targets['tar_slice_trigger'])
-            loss_dict['loss_trigger_slice'] = l_trigger_slice
-            total_loss += w_trigger_slice * l_trigger_slice
+            if _has_elements(outputs['atar_trigger_logits'], targets['tar_slice_trigger']):
+                l_trigger_slice = self.bce_logits(outputs['atar_trigger_logits'], targets['tar_slice_trigger'])
+                loss_dict['loss_trigger_slice'] = l_trigger_slice
+                total_loss += w_trigger_slice * l_trigger_slice
         
         # 3A. Kinematic Pion Stop (Phase 10 — per-graph regression)
         w_pion = self.config.get('w_pion_kinematics', 0.0)
         if w_pion > 0.0 and 'atar_pion_stop' in outputs and 'tar_pion_stop_xyz' in targets:
-            l_pion = F.smooth_l1_loss(outputs['atar_pion_stop'], targets['tar_pion_stop_xyz'])
-            loss_dict['loss_pion_kinematics'] = l_pion
-            total_loss += w_pion * l_pion
+            if 'tar_pion_stop_valid_graph' in targets:
+                valid_graph = targets['tar_pion_stop_valid_graph'].view(-1) > 0.5
+                if bool(valid_graph.any().item()):
+                    pred_pion = outputs['atar_pion_stop'][valid_graph]
+                    tar_pion = targets['tar_pion_stop_xyz'][valid_graph]
+                    l_pion = F.smooth_l1_loss(pred_pion, tar_pion)
+                    loss_dict['loss_pion_kinematics'] = l_pion
+                    total_loss += w_pion * l_pion
+            else:
+                l_pion = F.smooth_l1_loss(outputs['atar_pion_stop'], targets['tar_pion_stop_xyz'])
+                loss_dict['loss_pion_kinematics'] = l_pion
+                total_loss += w_pion * l_pion
             
         # 3B. Endpoints
         w_end = self.config.get('w_endpoints', 0.0)
@@ -497,10 +641,11 @@ class PURITYLoss(nn.Module):
             # Combine into [N, 2, 3]
             targets_xyz = torch.stack([targets_start, targets_stop], dim=1) * 10.0
             # Calculate Asymmetric Pinball Loss
-            l_end, end_breakdown = self.pinball(preds_xyz, targets_xyz)
-            for k, v in end_breakdown.items():
-                loss_dict[f'end_{k}'] = v
-            total_loss += w_end * l_end
+            if int(preds_xyz.numel()) > 0 and int(targets_xyz.numel()) > 0:
+                l_end, end_breakdown = self.pinball(preds_xyz, targets_xyz)
+                for k, v in end_breakdown.items():
+                    loss_dict[f'end_{k}'] = v
+                total_loss += w_end * l_end
             
         # 4. Positron Direction (Phase 11 — per-graph unit vector)
         w_angle = self.config.get('w_positron_angle', 0.0)
@@ -576,7 +721,7 @@ class PURITYLoss(nn.Module):
         w_event = self.config.get('w_event_builder', 0.0)
         if w_event > 0.0 and 'unified_event_logits' in outputs and batch is not None:
             # Call the new energy-weighted broadcast BCE
-            l_event = event_builder_loss(outputs, batch)
+            l_event = event_builder_loss(outputs, batch, strict_checks=strict_finite_checks)
             
             # If the loss returned a valid gradient tensor
             if l_event.requires_grad:
@@ -584,6 +729,14 @@ class PURITYLoss(nn.Module):
                 loss_dict['L_event_builder'] = l_event.item()
             else:
                 loss_dict['L_event_builder'] = 0.0
+
+        if not isinstance(total_loss, torch.Tensor):
+            # Keep a grad-carrying scalar so Lightning can step cleanly when all
+            # task heads were skipped for a sparse/guarded batch.
+            device = batch.x.device if batch is not None and hasattr(batch, "x") else torch.device("cpu")
+            total_loss = torch.tensor(float(total_loss), device=device, requires_grad=True)
+        if not bool(torch.isfinite(total_loss).all().item()):
+            raise RuntimeError("[purity_loss] non-finite total_loss after task aggregation.")
 
         loss_dict['loss_total'] = total_loss
         return total_loss, loss_dict
@@ -636,6 +789,10 @@ def format_targets_from_batch(batch):
                     slice_batch[slices[g]:slices[g+1]] = g
             num_graphs = batch.batch.max().item() + 1
             targets['tar_pion_stop_xyz'] = scatter(batch.atar_pion_stop_target, slice_batch, dim=0, dim_size=num_graphs, reduce='mean')
+            if hasattr(batch, 'atar_pion_stop_valid_target') and batch.atar_pion_stop_valid_target is not None:
+                valid_slice = batch.atar_pion_stop_valid_target.float().view(-1)
+                valid_graph = scatter(valid_slice, slice_batch, dim=0, dim_size=num_graphs, reduce='max')
+                targets['tar_pion_stop_valid_graph'] = valid_graph
 
             
     if hasattr(batch, 'atar_angle_target') and batch.atar_angle_target is not None:

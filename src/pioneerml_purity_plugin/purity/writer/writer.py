@@ -77,6 +77,20 @@ class PurityDataWriter(TimeGroupGraphDataWriter):
                     value_type=pa.float32(),
                     required=False,
                 ),
+                OutputColumnSpec(
+                    "pred_purity_guard_valid",
+                    model_output_name="guard_valid",
+                    dtype=np.float32,
+                    value_type=pa.float32(),
+                    required=False,
+                ),
+                OutputColumnSpec(
+                    "pred_purity_guard_reason",
+                    model_output_name="guard_reason",
+                    dtype=np.int32,
+                    value_type=pa.int32(),
+                    required=False,
+                ),
             )
         )
 
@@ -145,15 +159,15 @@ class PurityDataWriter(TimeGroupGraphDataWriter):
         summary_tensors: dict[str, torch.Tensor] = {}
         if isinstance(logits, Mapping):
             logits_map = logits
+            token_batch_maybe = logits_map.get("unified_token_batch")
+            if isinstance(token_batch_maybe, torch.Tensor):
+                token_batch = token_batch_maybe.to(dtype=torch.long)
+            token_valid_maybe = logits_map.get("unified_token_valid")
+            if isinstance(token_valid_maybe, torch.Tensor):
+                token_valid = token_valid_maybe.to(dtype=torch.bool)
             preferred = logits_map.get("unified_event_logits")
             if isinstance(preferred, torch.Tensor):
                 logits = preferred
-                token_batch_maybe = logits_map.get("unified_token_batch")
-                if isinstance(token_batch_maybe, torch.Tensor):
-                    token_batch = token_batch_maybe.to(dtype=torch.long)
-                token_valid_maybe = logits_map.get("unified_token_valid")
-                if isinstance(token_valid_maybe, torch.Tensor):
-                    token_valid = token_valid_maybe.to(dtype=torch.bool)
             else:
                 main = logits_map.get("main")
                 if isinstance(main, torch.Tensor):
@@ -172,6 +186,16 @@ class PurityDataWriter(TimeGroupGraphDataWriter):
                 pos_ang = event_summary.get("positron_polar_angle")
                 if isinstance(pos_ang, torch.Tensor):
                     summary_tensors["summary_positron_polar_angle"] = pos_ang
+            # TorchScript path exports flattened summary tensors directly.
+            for k in (
+                "summary_accepted",
+                "summary_positron_energy",
+                "summary_positron_time",
+                "summary_positron_polar_angle",
+            ):
+                v = logits_map.get(k)
+                if isinstance(v, torch.Tensor):
+                    summary_tensors[k] = v
         if not isinstance(logits, torch.Tensor):
             raise TypeError(
                 f"{self.__class__.__name__} expected tensor logits or mapping containing "
@@ -189,20 +213,50 @@ class PurityDataWriter(TimeGroupGraphDataWriter):
         prediction_event_ids_np = graph_event_ids_np
         prediction_group_ids_np = graph_time_group_ids_np
         token_index_np = None
-        if isinstance(token_batch, torch.Tensor) and int(token_batch.numel()) == int(logits.shape[0]):
+        token_index_oob_mask: np.ndarray | None = None
+
+        node_graph_id = getattr(batch, "node_graph_id", None)
+        x_node = getattr(batch, "x_node", None)
+        guard_valid_graph = np.ones((graph_event_ids_np.shape[0],), dtype=np.float32)
+        guard_reason_graph = np.zeros((graph_event_ids_np.shape[0],), dtype=np.int32)
+        if isinstance(node_graph_id, torch.Tensor) and isinstance(x_node, torch.Tensor) and int(graph_event_ids_np.shape[0]) > 0:
+            node_graph_idx = node_graph_id.detach().cpu().numpy().astype(np.int64, copy=False)
+            graph_count = int(graph_event_ids_np.shape[0])
+            node_counts = np.bincount(node_graph_idx, minlength=graph_count).astype(np.int64, copy=False)
+            is_atar = ((x_node[:, 5] > 0.5) | (x_node[:, 6] > 0.5)).detach().cpu().numpy().astype(np.bool_, copy=False)
+            atar_counts = np.bincount(node_graph_idx[is_atar], minlength=graph_count).astype(np.int64, copy=False)
+            no_hits = node_counts <= 0
+            no_atar = atar_counts <= 0
+            guard_valid_graph = (~(no_hits | no_atar)).astype(np.float32, copy=False)
+            guard_reason_graph = np.where(no_hits, 1, np.where(no_atar, 2, 0)).astype(np.int32, copy=False)
+
+        if isinstance(token_batch, torch.Tensor):
             idx = token_batch.detach().cpu().numpy().astype(np.int64, copy=False)
             if isinstance(token_valid, torch.Tensor):
                 keep = token_valid.detach().cpu().numpy().astype(np.bool_, copy=False).reshape(-1)
                 if keep.shape[0] == idx.shape[0]:
-                    idx = idx[keep]
-                    probs_np = probs_np[keep]
-                    logits_np = logits_np[keep]
+                    # TorchScript can emit token_batch/token_valid on the dense token axis
+                    # while logits are already compacted to valid tokens. Handle both.
+                    if int(logits.shape[0]) == int(idx.shape[0]):
+                        idx = idx[keep]
+                        probs_np = probs_np[keep]
+                        logits_np = logits_np[keep]
+                    elif int(logits.shape[0]) == int(keep.sum()):
+                        idx = idx[keep]
+
+            if int(idx.shape[0]) != int(logits.shape[0]):
+                logits_rows = int(logits.shape[0])
+                if int(idx.shape[0]) > logits_rows:
+                    idx = idx[:logits_rows]
+                else:
+                    pad = np.zeros((logits_rows - int(idx.shape[0]),), dtype=np.int64)
+                    idx = np.concatenate([idx, pad], axis=0)
+
             if idx.size > 0:
-                if int(idx.min()) < 0 or int(idx.max()) >= int(graph_event_ids_np.shape[0]):
-                    raise ValueError(
-                        f"{self.__class__.__name__} got unified_token_batch index out of range: "
-                        f"max={int(idx.max())}, num_graphs={int(graph_event_ids_np.shape[0])}."
-                    )
+                num_graphs = int(graph_event_ids_np.shape[0])
+                token_index_oob_mask = (idx < 0) | (idx >= num_graphs)
+                if bool(np.any(token_index_oob_mask)):
+                    idx = np.clip(idx, 0, max(num_graphs - 1, 0))
                 prediction_event_ids_np = graph_event_ids_np[idx]
                 prediction_group_ids_np = graph_time_group_ids_np[idx]
                 token_index_np = idx
@@ -240,6 +294,37 @@ class PurityDataWriter(TimeGroupGraphDataWriter):
                     aligned = summary.cpu().numpy().astype("float32", copy=False)
                 if int(aligned.shape[0]) == int(prediction_event_ids_np.shape[0]):
                     model_outputs_by_name[key] = aligned
+
+        if token_index_np is not None:
+            if int(token_index_np.size) == 0:
+                guard_valid_pred = np.zeros((0,), dtype=np.float32)
+                guard_reason_pred = np.zeros((0,), dtype=np.int32)
+            else:
+                guard_valid_pred = guard_valid_graph[token_index_np]
+                guard_reason_pred = guard_reason_graph[token_index_np]
+                if token_index_oob_mask is not None and token_index_oob_mask.shape[0] == guard_valid_pred.shape[0]:
+                    guard_valid_pred = guard_valid_pred.copy()
+                    guard_reason_pred = guard_reason_pred.copy()
+                    guard_valid_pred[token_index_oob_mask] = 0.0
+                    guard_reason_pred[token_index_oob_mask] = 4
+        else:
+            guard_valid_pred = guard_valid_graph
+            guard_reason_pred = guard_reason_graph
+
+        finite_mask_np = np.isfinite(logits_np.reshape(-1))
+        if guard_valid_pred.shape[0] == finite_mask_np.shape[0]:
+            guard_valid_pred = guard_valid_pred.copy()
+            guard_reason_pred = guard_reason_pred.copy()
+            guard_valid_pred[~finite_mask_np] = 0.0
+            guard_reason_pred[~finite_mask_np] = 3
+        if not bool(np.all(finite_mask_np)):
+            logits_np = np.nan_to_num(logits_np, nan=0.0, posinf=0.0, neginf=0.0)
+            probs_np = np.nan_to_num(probs_np, nan=0.5, posinf=1.0, neginf=0.0)
+
+        model_outputs_by_name["main"] = probs_np
+        model_outputs_by_name["logit"] = logits_np
+        model_outputs_by_name["guard_valid"] = guard_valid_pred.astype(np.float32, copy=False)
+        model_outputs_by_name["guard_reason"] = guard_reason_pred.astype(np.int32, copy=False)
 
         return TimeGroupPredictionSet(
             src_path=src_path,

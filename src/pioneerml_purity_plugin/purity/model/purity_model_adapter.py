@@ -43,10 +43,12 @@ class _PurityExportAdapter(nn.Module):
         token_batch = outputs.get("unified_token_batch")
         if token_batch is None:
             token_batch = torch.zeros((int(logits.size(0)),), dtype=torch.long, device=logits.device)
+        token_batch = token_batch.to(dtype=torch.long)
+        # Trace-safe normalization: keep token_batch on the same compact axis as logits.
+        token_batch = token_batch[: int(logits.size(0))]
 
-        token_valid = outputs.get("unified_token_valid")
-        if token_valid is None:
-            token_valid = torch.ones((int(logits.size(0)),), dtype=torch.bool, device=logits.device)
+        # Trace-safe compact validity mask.
+        token_valid = torch.ones((int(logits.size(0)),), dtype=torch.bool, device=logits.device)
 
         payload: dict[str, torch.Tensor] = {
             "unified_event_logits": logits,
@@ -55,6 +57,15 @@ class _PurityExportAdapter(nn.Module):
             # Keep "main" for generic writer/model-handle paths that look for a default output.
             "main": logits,
         }
+        for k in (
+            "summary_accepted",
+            "summary_positron_energy",
+            "summary_positron_time",
+            "summary_positron_polar_angle",
+        ):
+            v = outputs.get(k)
+            if isinstance(v, torch.Tensor):
+                payload[k] = v
         return payload
 
 
@@ -240,6 +251,17 @@ class PurityModel(BaseGraphClassifierModel):
         batch: torch.Tensor,
         task_weights: dict[str, float] | None = None,
     ) -> dict[str, torch.Tensor]:
+        # Inference path: if no explicit staged weights are provided, run the
+        # full fused task set so event-summary heads are active.
+        if task_weights is None and not self.training:
+            task_weights = {
+                "w_node_pdg": 0.5,
+                "w_atar_trigger_slice": 1.0,
+                "w_pion_kinematics": 0.0,
+                "w_event_builder": 1.0,
+                "w_positron_angle": 1.0,
+                "w_lyso_condensation": 0.5,
+            }
         return self.impl(x, batch, task_weights=task_weights)
 
     def _architecture_config(self) -> dict[str, Any]:

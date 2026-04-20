@@ -20,7 +20,7 @@ from pioneerml.data_loader.loaders.stage.stages import (
 from pioneerml.staged_runtime.stage_observers import StageObserver
 
 from .multi_level_graph_loader import MultiLevelGraphLoader
-from .stages import BuildPurityGraphStage
+from .stages import BuildPurityGraphStage, PurityRowGuardStage
 
 
 @LOADER_REGISTRY.register("purity")
@@ -59,6 +59,23 @@ class PurityGraphLoader(MultiLevelGraphLoader):
             lyso_pos_norm=float(params.get("lyso_pos_norm", 100.0)),
             lyso_energy_norm=float(params.get("lyso_energy_norm", 70.0)),
             lyso_time_norm=float(params.get("lyso_time_norm", 500.0)),
+            guard_rows_enabled=bool(params.get("guard_rows_enabled", True)),
+            guard_rows_training_only=bool(params.get("guard_rows_training_only", True)),
+            guard_require_nonempty_atar=bool(params.get("guard_require_nonempty_atar", True)),
+            guard_require_nonempty_total_hits=bool(params.get("guard_require_nonempty_total_hits", True)),
+            guard_max_total_hits=params.get("guard_max_total_hits"),
+            guard_require_finite_scalars=(
+                params["guard_require_finite_scalars"]
+                if "guard_require_finite_scalars" in params
+                else (
+                    "truth_theta",
+                    "truth_phi",
+                    "truth_positron_energy",
+                    "truth_pion_stop_x",
+                    "truth_pion_stop_y",
+                    "truth_pion_stop_z",
+                )
+            ),
             stage_overrides=stage_overrides if isinstance(stage_overrides, dict) else None,
             stage_observer=stage_observer if isinstance(stage_observer, StageObserver) else None,
             profiling=profiling,
@@ -81,6 +98,19 @@ class PurityGraphLoader(MultiLevelGraphLoader):
         lyso_pos_norm: float = 100.0,
         lyso_energy_norm: float = 70.0,
         lyso_time_norm: float = 500.0,
+        guard_rows_enabled: bool = True,
+        guard_rows_training_only: bool = True,
+        guard_require_nonempty_atar: bool = True,
+        guard_require_nonempty_total_hits: bool = True,
+        guard_max_total_hits: int | None = None,
+        guard_require_finite_scalars: list[str] | tuple[str, ...] | None = (
+            "truth_theta",
+            "truth_phi",
+            "truth_positron_energy",
+            "truth_pion_stop_x",
+            "truth_pion_stop_y",
+            "truth_pion_stop_z",
+        ),
         stage_overrides: dict[str, BaseStage] | None = None,
         stage_observer: StageObserver | None = None,
         profiling: dict | None = None,
@@ -92,6 +122,16 @@ class PurityGraphLoader(MultiLevelGraphLoader):
         self.lyso_pos_norm = float(lyso_pos_norm)
         self.lyso_energy_norm = float(lyso_energy_norm)
         self.lyso_time_norm = float(lyso_time_norm)
+        self.guard_rows_enabled = bool(guard_rows_enabled)
+        self.guard_rows_training_only = bool(guard_rows_training_only)
+        self.guard_require_nonempty_atar = bool(guard_require_nonempty_atar)
+        self.guard_require_nonempty_total_hits = bool(guard_require_nonempty_total_hits)
+        self.guard_max_total_hits = None if guard_max_total_hits is None else int(guard_max_total_hits)
+        self.guard_require_finite_scalars = tuple(
+            str(col).strip()
+            for col in (guard_require_finite_scalars or [])
+            if str(col).strip() != ""
+        )
 
         self.graph_dims = graph_dims or GraphTensorDims(
             node_feature_dim=int(self.NODE_FEATURE_DIM),
@@ -255,6 +295,7 @@ class PurityGraphLoader(MultiLevelGraphLoader):
             "row_filter",
             "distributed_shard",
             "row_join",
+            "guard_rows",
             "extract_features",
             "build_purity_graph",
             "pack_batch",
@@ -268,6 +309,14 @@ class PurityGraphLoader(MultiLevelGraphLoader):
             ),
             "distributed_shard": DistributedShardStage(event_id_column="event_id"),
             "row_join": RowJoinStage(),
+            "guard_rows": PurityRowGuardStage(
+                enabled=bool(self.guard_rows_enabled),
+                training_only=bool(self.guard_rows_training_only),
+                require_nonempty_atar=bool(self.guard_require_nonempty_atar),
+                require_nonempty_total_hits=bool(self.guard_require_nonempty_total_hits),
+                max_total_hits=self.guard_max_total_hits,
+                require_finite_scalar_columns=self.guard_require_finite_scalars,
+            ),
             "extract_features": ExtractFeaturesStage(
                 column_specs=self.schema.to_column_specs(include_targets=True),
                 output_state_key="features_in",
@@ -317,6 +366,7 @@ class PurityGraphLoader(MultiLevelGraphLoader):
                     "atar_slice_stop_target": "atar_slice_stop_target_out",
                     "atar_angle_target": "atar_angle_target_out",
                     "atar_pion_stop_target": "atar_pion_stop_target_out",
+                    "atar_pion_stop_valid_target": "atar_pion_stop_valid_target_out",
                     "positron_initial_energy_target": "positron_initial_energy_target_out",
                     "lyso_fracs_target": "lyso_fracs_target_out",
                     "lyso_payload_target": "lyso_payload_target_out",

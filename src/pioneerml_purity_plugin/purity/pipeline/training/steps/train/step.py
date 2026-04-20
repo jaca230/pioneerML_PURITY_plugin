@@ -4,6 +4,7 @@ import logging
 import math
 import re
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from pioneerml.integration.pytorch.trainers import TrainerFactory
@@ -14,6 +15,28 @@ from pioneerml.pipeline.steps.step_types.model_runner.utils import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class PurityPhase:
+    name: str
+    max_epochs: int | None
+    task_weights: dict[str, float] | None
+    freeze_all: bool
+    trainable_param_patterns: tuple[str, ...]
+    freeze_param_patterns: tuple[str, ...]
+    unfreeze_param_patterns: tuple[str, ...]
+    trainer_kwargs: dict[str, Any] | None
+    early_stopping: dict[str, Any] | None
+
+
+@dataclass(frozen=True)
+class PurityStagedTrainingConfig:
+    enabled: bool
+    phases: tuple[PurityPhase, ...]
+    strict_param_pattern_match: bool
+    reset_task_weights_after_training: bool
+    restore_param_trainability_after_training: bool
 
 
 class PurityStagedTrainingStep(BaseFullTrainingStep):
@@ -53,7 +76,7 @@ class PurityStagedTrainingStep(BaseFullTrainingStep):
         staged_cfg = self._resolve_staged_training_config()
         phase_summaries: list[dict[str, Any]] = []
         phase_loss_histories: list[dict[str, Any]] = []
-        if not staged_cfg["enabled"] or len(staged_cfg["phases"]) == 0:
+        if not staged_cfg.enabled or len(staged_cfg.phases) == 0:
             trainer.fit(
                 model=module,
                 train_dataloaders=train_loader,
@@ -62,7 +85,7 @@ class PurityStagedTrainingStep(BaseFullTrainingStep):
         else:
             original_trainability = self._snapshot_trainability(module=module)
             try:
-                for phase_index, phase in enumerate(staged_cfg["phases"], start=1):
+                for phase_index, phase in enumerate(staged_cfg.phases, start=1):
                     # Omar parity note:
                     # unified_reco training is staged by task weights, so we keep
                     # explicit phase boundaries and preserve per-phase loss slices
@@ -72,14 +95,14 @@ class PurityStagedTrainingStep(BaseFullTrainingStep):
                     trainability = self._apply_phase_trainability(
                         module=module,
                         phase=phase,
-                        strict_match=staged_cfg["strict_param_pattern_match"],
+                        strict_match=staged_cfg.strict_param_pattern_match,
                     )
-                    self._apply_phase_task_weights(module=module, task_weights=phase["task_weights"])
+                    self._apply_phase_task_weights(module=module, task_weights=phase.task_weights)
                     phase_trainer = self._build_phase_trainer(phase=phase)
                     LOGGER.info(
                         "[purity_staged_training] phase=%s configured_max_epochs=%s",
-                        phase["name"],
-                        int(phase["max_epochs"]) if phase["max_epochs"] is not None else self._resolved_base_max_epochs(),
+                        phase.name,
+                        int(phase.max_epochs) if phase.max_epochs is not None else self._resolved_base_max_epochs(),
                     )
                     phase_trainer.fit(
                         model=module,
@@ -92,14 +115,14 @@ class PurityStagedTrainingStep(BaseFullTrainingStep):
                     phase_val_losses = [float(v) for v in val_hist_full[val_hist_before:]]
                     LOGGER.info(
                         "[purity_staged_training] phase=%s train_loss_points=%s val_loss_points=%s",
-                        phase["name"],
+                        phase.name,
                         len(phase_train_losses),
                         len(phase_val_losses),
                     )
                     phase_loss_histories.append(
                         {
                             "index": int(phase_index),
-                            "name": str(phase["name"]),
+                            "name": str(phase.name),
                             "train_losses": phase_train_losses,
                             "val_losses": phase_val_losses,
                         }
@@ -107,13 +130,13 @@ class PurityStagedTrainingStep(BaseFullTrainingStep):
                     phase_summaries.append(
                         {
                             "index": int(phase_index),
-                            "name": str(phase["name"]),
+                            "name": str(phase.name),
                             "max_epochs": (
-                                int(phase["max_epochs"])
-                                if phase["max_epochs"] is not None
+                                int(phase.max_epochs)
+                                if phase.max_epochs is not None
                                 else self._resolved_base_max_epochs()
                             ),
-                            "task_weights": dict(phase["task_weights"] or {}),
+                            "task_weights": dict(phase.task_weights or {}),
                             "trainable_parameters": int(trainability["trainable_parameters"]),
                             "frozen_parameters": int(trainability["frozen_parameters"]),
                             "train_loss_points": len(phase_train_losses),
@@ -121,9 +144,9 @@ class PurityStagedTrainingStep(BaseFullTrainingStep):
                         }
                     )
             finally:
-                if staged_cfg["reset_task_weights_after_training"]:
+                if staged_cfg.reset_task_weights_after_training:
                     self._apply_phase_task_weights(module=module, task_weights=None)
-                if staged_cfg["restore_param_trainability_after_training"]:
+                if staged_cfg.restore_param_trainability_after_training:
                     self._restore_trainability(module=module, snapshot=original_trainability)
         if phase_loss_histories:
             # Persist on module so downstream notebook/debug tooling can render
@@ -151,16 +174,16 @@ class PurityStagedTrainingStep(BaseFullTrainingStep):
             )
         return payload
 
-    def _resolve_staged_training_config(self) -> dict[str, Any]:
+    def _resolve_staged_training_config(self) -> PurityStagedTrainingConfig:
         raw = self.config_json.get("staged_training")
         if raw is None:
-            return {
-                "enabled": False,
-                "phases": [],
-                "strict_param_pattern_match": False,
-                "reset_task_weights_after_training": True,
-                "restore_param_trainability_after_training": True,
-            }
+            return PurityStagedTrainingConfig(
+                enabled=False,
+                phases=(),
+                strict_param_pattern_match=False,
+                reset_task_weights_after_training=True,
+                restore_param_trainability_after_training=True,
+            )
         if not isinstance(raw, Mapping):
             raise TypeError("training.train.staged_training must be a mapping when provided.")
 
@@ -174,17 +197,17 @@ class PurityStagedTrainingStep(BaseFullTrainingStep):
         if not isinstance(raw_phases, Sequence) or isinstance(raw_phases, (str, bytes, bytearray)):
             raise TypeError("training.train.staged_training.phases must be a list.")
 
-        phases = [self._normalize_phase(idx=index, raw_phase=phase) for index, phase in enumerate(raw_phases)]
-        return {
-            "enabled": enabled,
-            "phases": phases,
-            "strict_param_pattern_match": strict_patterns,
-            "reset_task_weights_after_training": reset_weights,
-            "restore_param_trainability_after_training": restore_trainability,
-        }
+        phases = tuple(self._normalize_phase(idx=index, raw_phase=phase) for index, phase in enumerate(raw_phases))
+        return PurityStagedTrainingConfig(
+            enabled=enabled,
+            phases=phases,
+            strict_param_pattern_match=strict_patterns,
+            reset_task_weights_after_training=reset_weights,
+            restore_param_trainability_after_training=restore_trainability,
+        )
 
     @staticmethod
-    def _normalize_phase(*, idx: int, raw_phase: Any) -> dict[str, Any]:
+    def _normalize_phase(*, idx: int, raw_phase: Any) -> PurityPhase:
         context = f"training.train.staged_training.phases[{idx}]"
         if not isinstance(raw_phase, Mapping):
             raise TypeError(f"{context} must be a mapping.")
@@ -231,17 +254,17 @@ class PurityStagedTrainingStep(BaseFullTrainingStep):
             context=f"{context}.unfreeze_param_patterns",
         )
 
-        return {
-            "name": name,
-            "max_epochs": parsed_epochs,
-            "task_weights": task_weights,
-            "freeze_all": bool(phase.get("freeze_all", False)),
-            "trainable_param_patterns": trainable_patterns,
-            "freeze_param_patterns": freeze_patterns,
-            "unfreeze_param_patterns": unfreeze_patterns,
-            "trainer_kwargs": trainer_kwargs,
-            "early_stopping": early_stopping,
-        }
+        return PurityPhase(
+            name=name,
+            max_epochs=parsed_epochs,
+            task_weights=task_weights,
+            freeze_all=bool(phase.get("freeze_all", False)),
+            trainable_param_patterns=tuple(trainable_patterns),
+            freeze_param_patterns=tuple(freeze_patterns),
+            unfreeze_param_patterns=tuple(unfreeze_patterns),
+            trainer_kwargs=trainer_kwargs,
+            early_stopping=early_stopping,
+        )
 
     @staticmethod
     def _normalize_optional_mapping(raw: Any, *, context: str) -> dict[str, Any] | None:
@@ -298,18 +321,18 @@ class PurityStagedTrainingStep(BaseFullTrainingStep):
         self,
         *,
         module,
-        phase: Mapping[str, Any],
+        phase: PurityPhase,
         strict_match: bool,
     ) -> dict[str, int]:
         named_params = list(module.named_parameters())
         if len(named_params) == 0:
             return {"trainable_parameters": 0, "frozen_parameters": 0}
 
-        if bool(phase.get("freeze_all", False)):
+        if bool(phase.freeze_all):
             for _, param in named_params:
                 param.requires_grad = False
 
-        trainable_patterns = list(phase.get("trainable_param_patterns") or [])
+        trainable_patterns = list(phase.trainable_param_patterns or [])
         if trainable_patterns:
             for _, param in named_params:
                 param.requires_grad = False
@@ -317,21 +340,21 @@ class PurityStagedTrainingStep(BaseFullTrainingStep):
                 matched = self._set_requires_grad_by_pattern(named_params=named_params, pattern=pattern, value=True)
                 if strict_match and not matched:
                     raise RuntimeError(
-                        f"Staged training pattern '{pattern}' matched no parameters in phase '{phase['name']}'."
+                        f"Staged training pattern '{pattern}' matched no parameters in phase '{phase.name}'."
                     )
 
-        for pattern in list(phase.get("freeze_param_patterns") or []):
+        for pattern in list(phase.freeze_param_patterns or []):
             matched = self._set_requires_grad_by_pattern(named_params=named_params, pattern=pattern, value=False)
             if strict_match and not matched:
                 raise RuntimeError(
-                    f"Staged training pattern '{pattern}' matched no parameters in phase '{phase['name']}'."
+                    f"Staged training pattern '{pattern}' matched no parameters in phase '{phase.name}'."
                 )
 
-        for pattern in list(phase.get("unfreeze_param_patterns") or []):
+        for pattern in list(phase.unfreeze_param_patterns or []):
             matched = self._set_requires_grad_by_pattern(named_params=named_params, pattern=pattern, value=True)
             if strict_match and not matched:
                 raise RuntimeError(
-                    f"Staged training pattern '{pattern}' matched no parameters in phase '{phase['name']}'."
+                    f"Staged training pattern '{pattern}' matched no parameters in phase '{phase.name}'."
                 )
 
         trainable_parameters = sum(param.numel() for _, param in named_params if bool(param.requires_grad))
@@ -339,11 +362,11 @@ class PurityStagedTrainingStep(BaseFullTrainingStep):
         LOGGER.info(
             "[purity_staged_training] phase=%s freeze_all=%s trainable_patterns=%s freeze_patterns=%s "
             "unfreeze_patterns=%s trainable_parameters=%s frozen_parameters=%s",
-            phase["name"],
-            bool(phase.get("freeze_all", False)),
-            len(list(phase.get("trainable_param_patterns") or [])),
-            len(list(phase.get("freeze_param_patterns") or [])),
-            len(list(phase.get("unfreeze_param_patterns") or [])),
+            phase.name,
+            bool(phase.freeze_all),
+            len(list(phase.trainable_param_patterns or [])),
+            len(list(phase.freeze_param_patterns or [])),
+            len(list(phase.unfreeze_param_patterns or [])),
             trainable_parameters,
             frozen_parameters,
         )
@@ -377,7 +400,7 @@ class PurityStagedTrainingStep(BaseFullTrainingStep):
                 type(module).__name__,
             )
 
-    def _build_phase_trainer(self, *, phase: Mapping[str, Any]):
+    def _build_phase_trainer(self, *, phase: PurityPhase):
         cfg = self.runtime_state.get("resolved_training_config")
         if not isinstance(cfg, Mapping):
             cfg = self.config_json
@@ -388,15 +411,15 @@ class PurityStagedTrainingStep(BaseFullTrainingStep):
         trainer_cfg = dict(trainer_block.get("config") or {})
         trainer_kwargs = dict(trainer_cfg.get("trainer_kwargs") or {})
 
-        max_epochs = phase.get("max_epochs")
+        max_epochs = phase.max_epochs
         if max_epochs is not None:
             trainer_kwargs["max_epochs"] = int(max_epochs)
-        phase_trainer_kwargs = phase.get("trainer_kwargs")
+        phase_trainer_kwargs = phase.trainer_kwargs
         if isinstance(phase_trainer_kwargs, Mapping):
             trainer_kwargs = merge_nested_dicts(base=trainer_kwargs, override=phase_trainer_kwargs)
 
         early_stopping = dict(trainer_cfg.get("early_stopping") or {})
-        phase_early_stopping = phase.get("early_stopping")
+        phase_early_stopping = phase.early_stopping
         if isinstance(phase_early_stopping, Mapping):
             early_stopping = merge_nested_dicts(base=early_stopping, override=phase_early_stopping)
 

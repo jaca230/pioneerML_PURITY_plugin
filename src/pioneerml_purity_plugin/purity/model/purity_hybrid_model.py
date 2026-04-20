@@ -31,6 +31,33 @@ MODALITY_ATAR_XZ = 0
 MODALITY_ATAR_YZ = 1
 MODALITY_LYSO = 2
 
+
+@torch.jit.ignore
+def _finite_stats(name: str, t: torch.Tensor) -> str:
+    flat = t.detach().reshape(-1)
+    if flat.numel() == 0:
+        return f"{name}:numel=0"
+    finite = torch.isfinite(flat)
+    finite_count = int(finite.sum().item())
+    nan_count = int(torch.isnan(flat).sum().item())
+    inf_count = int(torch.isinf(flat).sum().item())
+    min_v = float(flat[finite].min().item()) if finite_count > 0 else float("nan")
+    max_v = float(flat[finite].max().item()) if finite_count > 0 else float("nan")
+    return (
+        f"{name}:shape={tuple(t.shape)} numel={int(flat.numel())} "
+        f"finite={finite_count} nan={nan_count} inf={inf_count} "
+        f"min={min_v:.6g} max={max_v:.6g}"
+    )
+
+
+@torch.jit.ignore
+def _require_finite(name: str, t: torch.Tensor) -> None:
+    if not bool(torch.isfinite(t).all().item()):
+        raise RuntimeError(
+            f"[purity_model] {name} has non-finite values.\n"
+        )
+
+
 def physics_edge_index_batch(x, batch):
     """
     Creates a sparse graph with true time-slice fully connected subgraphs 
@@ -533,7 +560,15 @@ class PurityHybridModel(nn.Module):
             h_atar_in[is_atar] = h_proj + self.atar_view_embedding(view_idx)
 
         if is_lyso.any():
+            if not torch.jit.is_scripting():
+                for pname, pval in self.lyso_encoder.named_parameters():
+                    if not torch.jit.is_scripting():
+                        _require_finite(f"lyso_encoder_param:{pname}", pval)
+            if not torch.jit.is_scripting():
+                _require_finite("x_lyso_input", x[is_lyso, :5])
             h_lyso_in[is_lyso] = self.lyso_encoder(x[is_lyso, :5])  # [x, y, z, E, t]
+            if not torch.jit.is_scripting():
+                _require_finite("h_lyso_in", h_lyso_in[is_lyso])
 
         # 2. Physics-Based Edge Construction — intra-slice, no cross-subsystem edges
         edge_index = physics_edge_index_batch(x, batch)
@@ -556,6 +591,9 @@ class PurityHybridModel(nn.Module):
 
         atar_edge_attr = build_atar_edge_attr(x, atar_edge_index)  # [E_atar, 4]
         lyso_edge_attr = build_lyso_edge_attr(x, lyso_edge_index)  # [E_lyso, 5]
+        if int(lyso_edge_attr.numel()) > 0:
+            if not torch.jit.is_scripting():
+                _require_finite("lyso_edge_attr", lyso_edge_attr)
 
         # ATAR message passing
         h_atar = h_atar_in
@@ -574,8 +612,12 @@ class PurityHybridModel(nn.Module):
         if is_lyso.any():
             for block in self.lyso_blocks:
                 h_lyso = block(h_lyso, lyso_edge_index, lyso_edge_attr)
+                if not torch.jit.is_scripting():
+                    _require_finite("h_lyso_block", h_lyso[is_lyso])
                 lyso_xs.append(h_lyso[is_lyso])
             h_lyso_jk = self.lyso_jk(lyso_xs)  # [N_lyso, jk_dim]
+            if not torch.jit.is_scripting():
+                _require_finite("h_lyso_jk", h_lyso_jk)
         else:
             h_lyso_jk = torch.zeros(0, self.lyso_encoder[0].out_features * len(self.lyso_blocks), device=x.device)
 
@@ -589,7 +631,8 @@ class PurityHybridModel(nn.Module):
 
         # Phase 2: The Dense Cross-Attention Bridge
         h_out_new = h_out.clone()
-        if is_atar.any() and is_lyso.any():
+        enable_cross_attention = (w_event_builder > 0.0 or w_positron_angle > 0.0)
+        if is_atar.any() and is_lyso.any() and enable_cross_attention:
             h_atar = h_out[is_atar]
             h_calo = h_out[is_lyso]
             batch_atar = batch[is_atar]
@@ -622,16 +665,18 @@ class PurityHybridModel(nn.Module):
                 # unblocking only prevents NaN gradients, not actual signal leakage.
                 safe_time_block = time_block & (~all_keys_blocked.unsqueeze(2))
                 num_heads = self.cross_attention.num_heads
-                attn_mask = torch.zeros_like(safe_time_block, dtype=h_atar_dense.dtype)
-                attn_mask[safe_time_block] = float('-inf')
+                # Use boolean attention masks to avoid -inf additive-mask edge cases that
+                # can produce NaN gradients in MHA kernels when rows are heavily masked.
+                attn_mask = safe_time_block.to(dtype=torch.bool)
                 attn_mask = attn_mask.repeat_interleave(num_heads, dim=0)  # [B*nhead, N_atar, N_lyso]
-                key_padding_mask = torch.zeros(
-                    calo_mask.size(0),
-                    calo_mask.size(1),
-                    dtype=h_atar_dense.dtype,
-                    device=h_atar_dense.device,
-                )
-                key_padding_mask = key_padding_mask.masked_fill(~calo_mask, float("-inf"))
+                key_padding_mask = ~calo_mask
+                # Numerical safety: MHA produces NaNs when an entire graph has all keys masked.
+                # For graphs with no LYSO keys, unmask one padded key (value is zero) so the
+                # attention kernel remains well-defined; we still zero these query outputs below.
+                no_calo_keys = ~calo_mask.any(dim=1)
+                if bool(no_calo_keys.any().item()):
+                    key_padding_mask = key_padding_mask.clone()
+                    key_padding_mask[no_calo_keys, 0] = False
             else:
                 attn_mask = None
                 all_keys_blocked = None
@@ -1068,11 +1113,19 @@ class PurityHybridModel(nn.Module):
         # === LYSO PREDICTIONS (Object Condensation) ===
         if is_lyso.any():
             h_lyso = h_out[is_lyso]
+            if not torch.jit.is_scripting():
+                _require_finite("h_lyso", h_lyso)
 
             if w_lyso_condensation > 0.0:
                 output['lyso_beta'] = self.lyso_beta_head(h_lyso)
                 output['lyso_cluster_coords'] = self.lyso_cluster_coord_head(h_lyso)
                 output['lyso_fractions'] = self.lyso_fraction_head(h_lyso)
+                if not torch.jit.is_scripting():
+                    _require_finite("lyso_beta", output['lyso_beta'])
+                if not torch.jit.is_scripting():
+                    _require_finite("lyso_cluster_coords", output['lyso_cluster_coords'])
+                if not torch.jit.is_scripting():
+                    _require_finite("lyso_fractions", output['lyso_fractions'])
             output['lyso_embedding'] = h_lyso
             
             # Pool LYSO hits per Time Slice for global feature combinations
@@ -1104,6 +1157,12 @@ class PurityHybridModel(nn.Module):
             g_coords, mask = to_dense_batch(pred_coords, lyso_batch, batch_size=B) # [B, N_max, 3]
             g_beta, _ = to_dense_batch(pred_beta, lyso_batch, batch_size=B)
             g_feats, _ = to_dense_batch(h_lyso, lyso_batch, batch_size=B)
+            if not torch.jit.is_scripting():
+                _require_finite("g_coords", g_coords)
+            if not torch.jit.is_scripting():
+                _require_finite("g_beta", g_beta)
+            if not torch.jit.is_scripting():
+                _require_finite("g_feats", g_feats)
             
             x_lyso = x[is_lyso]
             g_slice_id, _ = to_dense_batch(x_lyso[:, 8], lyso_batch, batch_size=B)
@@ -1132,6 +1191,8 @@ class PurityHybridModel(nn.Module):
             tau = 0.8
             affinity = torch.exp(-dists / tau) * seed_beta.unsqueeze(1) # [B, N_max, actual_k]
             affinity[~mask] = 0.0 # Nullify out-bound affinity from padded matching nodes
+            if not torch.jit.is_scripting():
+                _require_finite("affinity_pre_gate", affinity)
 
             # Slice-ID gate: hits from a different physics slice than the seed cannot
             # belong to the same cluster. Without this, OC freely merges radiation
@@ -1140,6 +1201,8 @@ class PurityHybridModel(nn.Module):
             seed_slice_id = torch.gather(g_slice_id, 1, topk_idx).long()        # [B, actual_k]
             slice_match = g_slice_id.long().unsqueeze(-1) == seed_slice_id.unsqueeze(1)  # [B, N_max, actual_k]
             affinity = affinity * slice_match.float()
+            if not torch.jit.is_scripting():
+                _require_finite("affinity_post_gate", affinity)
 
             # Adaptive dustbin: the floor fades to 0 when a hit has a strong real match
             # (max affinity → 1) so signal hits can reach w=1, but grows to 0.05 for orphan
@@ -1147,6 +1210,8 @@ class PurityHybridModel(nn.Module):
             max_affinity = affinity.max(dim=2, keepdim=True).values.clamp(min=0.0, max=1.0)  # [B, N_max, 1]
             adaptive_floor = 0.05 * (1.0 - max_affinity)                                     # [B, N_max, 1]
             w_norm = affinity / (affinity.sum(dim=2, keepdim=True) + adaptive_floor)         # [B, N_max, actual_k]
+            if not torch.jit.is_scripting():
+                _require_finite("w_norm", w_norm)
             
             g_pool = torch.bmm(w_norm.transpose(1, 2), g_feats)  # [B, actual_k, D]
             # Restored β² pool attenuation: w_norm already carries one β through
@@ -1389,6 +1454,8 @@ class PurityHybridModel(nn.Module):
                     beta_flat,            # 1  (OC seed confidence)
                     soft_n_hits_flat,     # 1  (cluster occupancy = Σw)
                 ], dim=-1)  # [Total_K, 9]
+                if not torch.jit.is_scripting():
+                    _require_finite("angular_feat_full", angular_feat_full)
                 lyso_cluster_times = cluster_mean_time_padded[has_lyso].view(-1) * self.norm_t_lyso  # [Total_K] raw ns (back from normalized for temporal bias)
                 lyso_cluster_etimes = cluster_energy_time_padded[has_lyso].view(-1)  # [Total_K]
                 lyso_cluster_energies = cluster_e_mean.view(-1).detach()  # [Total_K] normalized cluster E (for attention bias scaling)
@@ -1464,7 +1531,11 @@ class PurityHybridModel(nn.Module):
             all_batch.append(B_atar_idx)
             all_valid.append(torch.ones(atar_tokens_with_mod.size(0), dtype=torch.bool, device=x.device))
             unified_num_atar_tokens = all_tokens[0].size(0)
-            output['unified_num_atar_tokens'] = torch.tensor(unified_num_atar_tokens, dtype=torch.long, device=x.device)
+            output['unified_num_atar_tokens'] = torch.as_tensor(
+                unified_num_atar_tokens,
+                dtype=torch.long,
+                device=x.device,
+            )
 
         if is_lyso.any() and 'lyso_soft_assignments' in output:
             lyso_tokens_with_mod = lyso_event_tokens + self.event_modality_emb.weight[1]
@@ -1501,6 +1572,10 @@ class PurityHybridModel(nn.Module):
             # could silently desync for tail-empty graphs).
             dense_tokens, pad_mask = to_dense_batch(unified_tokens, unified_batch, batch_size=num_graphs_in_batch) # [B, max_tokens, D_A]
             dense_idx, _ = to_dense_batch(original_idx, unified_batch, batch_size=num_graphs_in_batch)
+            if not bool(torch.isfinite(dense_tokens).all().item()):
+                raise RuntimeError(
+                    "[purity_model] dense_tokens has non-finite values before event transformer.\n"
+                )
 
             # Use to_dense_batch to naturally align our custom manual validity mask!
             # Any element explicitly marked False (our manual LYSO padding) or
@@ -1666,6 +1741,10 @@ class PurityHybridModel(nn.Module):
                 #     src_mask = src_mask + lyso_pair_mat
 
             # TransformerEncoder expects mask as [T,T] or [B*nhead, T, T]
+            if not bool(torch.isfinite(src_mask).all().item()):
+                raise RuntimeError(
+                    "[purity_model] src_mask has non-finite values before event transformer.\n"
+                )
             nhead = 2  # Must match slim TransformerEncoderLayer nhead
             # Expand [B, T, T] -> [B*nhead, T, T]
             src_mask_expanded = src_mask.unsqueeze(1).expand(-1, nhead, -1, -1).reshape(
@@ -1677,25 +1756,43 @@ class PurityHybridModel(nn.Module):
                 mask=src_mask_expanded,
                 src_key_padding_mask=padding_mask
             )
+            if not bool(torch.isfinite(transformed_tokens).all().item()):
+                raise RuntimeError(
+                    "[purity_model] transformed_tokens has non-finite values after event transformer.\n"
+                )
 
             # Flatten back
             flat_transformed = transformed_tokens[pad_mask]
             flat_idx = dense_idx[pad_mask]
+            flat_modality = dense_modality[pad_mask]
 
             # Un-shuffle back into [ATAR_TOKENS, LYSO_TOKENS] format
             inverse_sort = torch.argsort(flat_idx)
             flat_transformed = flat_transformed[inverse_sort]
+            flat_modality = flat_modality[inverse_sort]
 
             # Classifier: project transformer 32D → 8D, concat [coinc_feat, cos_sep] → Linear(10, 1)
             n_atar_tok = unified_num_atar_tokens
             coinc_skip_in = output.get('lyso_coinc_skip_input')  # [Total_K, 2]
             projected = self.event_head_proj(flat_transformed)  # [total_tokens, 8]
             phys_feat = torch.zeros(projected.size(0), 2, device=projected.device)
-            if coinc_skip_in is not None and n_atar_tok < projected.size(0):
-                phys_feat[n_atar_tok:] = coinc_skip_in
+            if coinc_skip_in is not None and int(coinc_skip_in.size(0)) > 0 and int(projected.size(0)) > 0:
+                # Tensor-only LYSO token mapping avoids trace-time shape capture from
+                # Python slicing/ints and remains robust when runtime token counts vary.
+                lyso_mask = (flat_modality == 1)
+                lyso_rank = torch.cumsum(lyso_mask.long(), dim=0) - 1
+                safe_rank = lyso_rank.clamp(min=0, max=int(coinc_skip_in.size(0)) - 1)
+                mapped = coinc_skip_in[safe_rank]
+                valid_rank = lyso_rank < int(coinc_skip_in.size(0))
+                write_mask = lyso_mask & valid_rank
+                phys_feat = torch.where(write_mask.unsqueeze(1), mapped, phys_feat)
 
             event_logits = self.event_head(
                 torch.cat([projected, phys_feat], dim=-1))  # [total_tokens, 1]
+            if not bool(torch.isfinite(event_logits).all().item()):
+                raise RuntimeError(
+                    "[purity_model] unified event_logits has non-finite values.\n"
+                )
 
             output['unified_event_logits'] = event_logits
             output['unified_token_batch'] = unified_batch
@@ -1749,7 +1846,17 @@ class PurityHybridModel(nn.Module):
             K = w_lyso.size(1)
             lyso_p = torch.sigmoid(ev_logits[n_atar_tok:].view(-1))  # [Total_K]
             beta_bk = beta_lyso.view(-1, K)
-            p_bk = lyso_p.view(-1, K)
+            # TorchScript/trace can emit token counts that are not perfectly divisible by K.
+            # Keep only full K-blocks and align with available beta rows.
+            lyso_blocks = int(lyso_p.numel()) // int(K)
+            beta_blocks = int(beta_bk.size(0))
+            usable_blocks = min(lyso_blocks, beta_blocks)
+            if usable_blocks <= 0:
+                beta_bk = beta_bk[:0]
+                p_bk = lyso_p.new_zeros((0, int(K)))
+            else:
+                p_bk = lyso_p[: usable_blocks * int(K)].view(usable_blocks, int(K))
+                beta_bk = beta_bk[:usable_blocks]
             # Rebuild has_lyso -> valid-graph mapping
             hit_graph = batch[is_lyso]
             counts = torch.zeros(B, device=device, dtype=torch.long)
@@ -1759,14 +1866,20 @@ class PurityHybridModel(nn.Module):
             graph_to_valid[has_lyso_g] = torch.arange(
                 int(has_lyso_g.sum().item()), device=device)
             hit_vg = graph_to_valid[hit_graph]  # [N_lyso]
-            wb = w_lyso * beta_bk[hit_vg]  # [N_lyso, K]
-            wb_sum = wb.sum(dim=1).clamp(min=1e-6)
-            p_hit = (wb * p_bk[hit_vg]).sum(dim=1) / wb_sum  # [N_lyso]
-            output['lyso_hit_trigger_prob'] = p_hit.detach()
-            lyso_mask = (p_hit > 0.5).float()
-            e_lyso = x[is_lyso, 3]
-            pos_energy.index_add_(0, hit_graph, e_lyso * lyso_mask)
-            has_any = True
+            valid_vg = (hit_vg >= 0) & (hit_vg < int(usable_blocks))
+            if bool(valid_vg.any().item()):
+                hit_vg_valid = hit_vg[valid_vg]
+                w_lyso_valid = w_lyso[valid_vg]
+                wb = w_lyso_valid * beta_bk[hit_vg_valid]  # [N_valid_lyso, K]
+                wb_sum = wb.sum(dim=1).clamp(min=1e-6)
+                p_hit_valid = (wb * p_bk[hit_vg_valid]).sum(dim=1) / wb_sum  # [N_valid_lyso]
+                p_hit = torch.zeros_like(hit_vg, dtype=torch.float32)
+                p_hit[valid_vg] = p_hit_valid
+                output['lyso_hit_trigger_prob'] = p_hit.detach()
+                lyso_mask = (p_hit > 0.5).float()
+                e_lyso = x[is_lyso, 3]
+                pos_energy.index_add_(0, hit_graph, e_lyso * lyso_mask)
+                has_any = True
 
         if not has_any:
             pos_energy = torch.full((B,), SENTINEL, device=device)
@@ -1779,6 +1892,11 @@ class PurityHybridModel(nn.Module):
         )
         angle_ok = positron_dir[:, 2] > self.accept_angle_cos
         accepted = (fiducial & angle_ok).float()
+
+        output['summary_accepted'] = accepted.detach()
+        output['summary_positron_energy'] = pos_energy.detach()
+        output['summary_positron_time'] = pos_time.detach()
+        output['summary_positron_polar_angle'] = polar_angle.detach()
 
         if not torch.jit.is_scripting():
             output['event_summary'] = {

@@ -112,3 +112,26 @@ class PurityMultiLevelLightningModule(GraphLightningModule):
                 target = target.unsqueeze(1)
             return target
         return super().primary_target(batch, preds)
+
+    def on_before_optimizer_step(self, optimizer: optim.Optimizer) -> None:
+        """Fail fast on non-finite gradients before parameters are updated."""
+        for name, param in self.named_parameters():
+            grad = param.grad
+            if grad is None:
+                continue
+            if not bool(torch.isfinite(grad).all().item()):
+                flat = grad.detach().reshape(-1)
+                finite = torch.isfinite(flat)
+                finite_count = int(finite.sum().item())
+                nan_count = int(torch.isnan(flat).sum().item())
+                inf_count = int(torch.isinf(flat).sum().item())
+                min_v = float(flat[finite].min().item()) if finite_count > 0 else float("nan")
+                max_v = float(flat[finite].max().item()) if finite_count > 0 else float("nan")
+                raise RuntimeError(
+                    "[purity_module] non-finite gradient detected before optimizer step "
+                    f"for parameter={name}\n"
+                    f"shape={tuple(grad.shape)} numel={int(flat.numel())} "
+                    f"finite={finite_count} nan={nan_count} inf={inf_count} "
+                    f"min={min_v:.6g} max={max_v:.6g}"
+                )
+        return super().on_before_optimizer_step(optimizer)

@@ -28,6 +28,7 @@ class MultiLevelGraphLoader(GraphLoader):
                 "atar_slice_stop_target",
                 "atar_angle_target",
                 "atar_pion_stop_target",
+                "atar_pion_stop_valid_target",
                 "positron_initial_energy_target",
                 "lyso_fracs_target",
                 "lyso_payload_target",
@@ -57,6 +58,7 @@ class MultiLevelGraphLoader(GraphLoader):
         data.atar_slice_stop_target = torch.empty((0, 3), dtype=torch.float32)
         data.atar_angle_target = torch.empty((0, 3), dtype=torch.float32)
         data.atar_pion_stop_target = torch.empty((0, 3), dtype=torch.float32)
+        data.atar_pion_stop_valid_target = torch.empty((0,), dtype=torch.float32)
         data.positron_initial_energy_target = torch.empty((0, 1), dtype=torch.float32)
         data.lyso_fracs_target = torch.empty((0, 20), dtype=torch.float32)
         data.lyso_payload_target = torch.empty((0, 20, 4), dtype=torch.float32)
@@ -194,6 +196,10 @@ class MultiLevelGraphLoader(GraphLoader):
             d.atar_pion_stop_target = chunk["atar_pion_stop_target"][a0:a1]
         else:
             d.atar_pion_stop_target = torch.empty((0, 3), dtype=torch.float32)
+        if "atar_pion_stop_valid_target" in chunk and chunk["atar_pion_stop_valid_target"] is not None and a1 > a0:
+            d.atar_pion_stop_valid_target = chunk["atar_pion_stop_valid_target"][a0:a1]
+        else:
+            d.atar_pion_stop_valid_target = torch.empty((0,), dtype=torch.float32)
 
         d.x = d.x_node
         d.batch = d.node_graph_id
