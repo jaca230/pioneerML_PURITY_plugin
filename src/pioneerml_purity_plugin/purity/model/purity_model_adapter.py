@@ -235,7 +235,7 @@ class PurityModel(BaseGraphClassifierModel):
         _ = edge_attr
         if isinstance(data_or_x, Data):
             x_node, node_graph_id = self._resolve_batch_input(data_or_x)
-            return self.impl(x_node, node_graph_id, task_weights=task_weights)
+            return self.forward_tensors(x_node, node_graph_id, task_weights=task_weights)
 
         resolved_batch: torch.Tensor | None = batch
         # Support both `(x, batch)` and `(x, edge_index, edge_attr, batch)` call styles.
@@ -243,7 +243,135 @@ class PurityModel(BaseGraphClassifierModel):
             resolved_batch = edge_index
         if resolved_batch is None:
             raise ValueError("PurityModel.forward requires `batch` when called with tensor inputs.")
-        return self.impl(data_or_x, resolved_batch, task_weights=task_weights)
+        return self.forward_tensors(data_or_x, resolved_batch, task_weights=task_weights)
+
+    def _attach_inference_summary(
+        self,
+        *,
+        outputs: dict[str, torch.Tensor],
+        x: torch.Tensor,
+        batch: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        if int(batch.numel()) <= 0:
+            return outputs
+
+        b = int(batch.max().item()) + 1
+        device = x.device
+        sentinel = -999.0
+
+        pion_stop = outputs.get("atar_pion_stop")
+        if not isinstance(pion_stop, torch.Tensor):
+            pion_stop = torch.full((b, 3), sentinel, dtype=torch.float32, device=device)
+        else:
+            pion_stop = pion_stop.to(dtype=torch.float32, device=device)
+            if int(pion_stop.size(0)) < b:
+                pad = torch.full((b - int(pion_stop.size(0)), 3), sentinel, dtype=torch.float32, device=device)
+                pion_stop = torch.cat([pion_stop, pad], dim=0)
+            elif int(pion_stop.size(0)) > b:
+                pion_stop = pion_stop[:b]
+
+        positron_dir = outputs.get("atar_positron_dir")
+        if not isinstance(positron_dir, torch.Tensor):
+            positron_dir = torch.full((b, 3), sentinel, dtype=torch.float32, device=device)
+            polar_angle = torch.full((b,), sentinel, dtype=torch.float32, device=device)
+        else:
+            positron_dir = positron_dir.to(dtype=torch.float32, device=device)
+            if int(positron_dir.size(0)) < b:
+                pad = torch.full((b - int(positron_dir.size(0)), 3), sentinel, dtype=torch.float32, device=device)
+                positron_dir = torch.cat([positron_dir, pad], dim=0)
+            elif int(positron_dir.size(0)) > b:
+                positron_dir = positron_dir[:b]
+            cos_theta = positron_dir[:, 2].clamp(-1.0, 1.0)
+            polar_angle = torch.acos(cos_theta)
+
+        pos_time = outputs.get("positron_time_per_graph")
+        if not isinstance(pos_time, torch.Tensor):
+            pos_time = torch.full((b,), sentinel, dtype=torch.float32, device=device)
+        else:
+            pos_time = pos_time.to(dtype=torch.float32, device=device).view(-1)
+            if int(pos_time.size(0)) < b:
+                pad = torch.full((b - int(pos_time.size(0)),), sentinel, dtype=torch.float32, device=device)
+                pos_time = torch.cat([pos_time, pad], dim=0)
+            elif int(pos_time.size(0)) > b:
+                pos_time = pos_time[:b]
+
+        pos_energy = torch.full((b,), sentinel, dtype=torch.float32, device=device)
+        is_atar = (x[:, 5] > 0.5) | (x[:, 6] > 0.5)
+        trig = outputs.get("atar_hit_trigger_prob")
+        mip = outputs.get("atar_hit_mip_prob")
+        if isinstance(trig, torch.Tensor) and isinstance(mip, torch.Tensor) and bool(is_atar.any().item()):
+            trig = trig.to(dtype=torch.float32, device=device).view(-1)
+            mip = mip.to(dtype=torch.float32, device=device).view(-1)
+            batch_atar = batch[is_atar].to(dtype=torch.long, device=device)
+            e_atar = x[is_atar, 3].to(dtype=torch.float32, device=device)
+            n = min(int(batch_atar.size(0)), int(trig.size(0)), int(mip.size(0)))
+            if n > 0:
+                hit_mask = ((trig[:n] > 0.5) & (mip[:n] > 0.5)).to(dtype=torch.float32)
+                pos_energy = torch.zeros((b,), dtype=torch.float32, device=device)
+                pos_energy.index_add_(0, batch_atar[:n], e_atar[:n] * hit_mask)
+
+        # Optional LYSO contribution (same semantics as the original summary block):
+        # use assignment-weighted trigger probabilities for LYSO hits.
+        w_lyso = outputs.get("lyso_soft_assignments")
+        beta_lyso = outputs.get("lyso_seed_beta")
+        ev_logits = outputs.get("unified_event_logits")
+        n_atar_tok_t = outputs.get("unified_num_atar_tokens")
+        is_lyso = x[:, 7] > 0.5
+        if (
+            isinstance(w_lyso, torch.Tensor)
+            and isinstance(beta_lyso, torch.Tensor)
+            and isinstance(ev_logits, torch.Tensor)
+            and bool(is_lyso.any().item())
+        ):
+            k = int(w_lyso.size(1)) if int(w_lyso.dim()) >= 2 else 0
+            if k > 0:
+                n_atar_tok = 0
+                if isinstance(n_atar_tok_t, torch.Tensor) and int(n_atar_tok_t.numel()) > 0:
+                    n_atar_tok = int(n_atar_tok_t.view(-1)[0].item())
+                lyso_logits = ev_logits.view(-1)[n_atar_tok:]
+                lyso_p = torch.sigmoid(lyso_logits)
+                beta_bk = beta_lyso.view(-1, k)
+                lyso_blocks = int(lyso_p.numel()) // int(k)
+                beta_blocks = int(beta_bk.size(0))
+                usable_blocks = min(lyso_blocks, beta_blocks)
+                if usable_blocks > 0:
+                    p_bk = lyso_p[: usable_blocks * int(k)].view(usable_blocks, int(k))
+                    beta_bk = beta_bk[:usable_blocks]
+                    hit_graph = batch[is_lyso].to(dtype=torch.long, device=device)
+                    counts = torch.zeros((b,), dtype=torch.long, device=device)
+                    counts.index_add_(0, hit_graph, torch.ones_like(hit_graph))
+                    has_lyso_g = counts > 0
+                    graph_to_valid = torch.full((b,), -1, dtype=torch.long, device=device)
+                    graph_to_valid[has_lyso_g] = torch.arange(int(has_lyso_g.sum().item()), device=device)
+                    hit_vg = graph_to_valid[hit_graph]
+                    valid_vg = (hit_vg >= 0) & (hit_vg < int(usable_blocks))
+                    if bool(valid_vg.any().item()):
+                        hit_vg_valid = hit_vg[valid_vg]
+                        w_lyso_valid = w_lyso[valid_vg]
+                        wb = w_lyso_valid * beta_bk[hit_vg_valid]
+                        wb_sum = wb.sum(dim=1).clamp(min=1e-6)
+                        p_hit_valid = (wb * p_bk[hit_vg_valid]).sum(dim=1) / wb_sum
+                        lyso_mask = (p_hit_valid > 0.5).to(dtype=torch.float32)
+                        e_lyso = x[is_lyso, 3].to(dtype=torch.float32, device=device)[valid_vg]
+                        if int(pos_energy.numel()) == 0 or bool((pos_energy == sentinel).all().item()):
+                            pos_energy = torch.zeros((b,), dtype=torch.float32, device=device)
+                        pos_energy.index_add_(0, hit_graph[valid_vg], e_lyso * lyso_mask)
+
+        ps_raw = pion_stop * float(self.impl.norm_pos_atar)
+        fiducial = (
+            (ps_raw[:, 2] > float(self.impl.accept_z_min_mm))
+            & (ps_raw[:, 2] < float(self.impl.accept_z_max_mm))
+            & (ps_raw[:, 0].abs() < float(self.impl.accept_xy_max_mm))
+            & (ps_raw[:, 1].abs() < float(self.impl.accept_xy_max_mm))
+        )
+        angle_ok = positron_dir[:, 2] > float(self.impl.accept_angle_cos)
+        accepted = (fiducial & angle_ok).to(dtype=torch.float32)
+
+        outputs["summary_accepted"] = accepted
+        outputs["summary_positron_energy"] = pos_energy
+        outputs["summary_positron_time"] = pos_time
+        outputs["summary_positron_polar_angle"] = polar_angle
+        return outputs
 
     def forward_tensors(
         self,
@@ -262,7 +390,10 @@ class PurityModel(BaseGraphClassifierModel):
                 "w_positron_angle": 1.0,
                 "w_lyso_condensation": 0.5,
             }
-        return self.impl(x, batch, task_weights=task_weights)
+        outputs = self.impl(x, batch, task_weights=task_weights)
+        if not self.training:
+            outputs = self._attach_inference_summary(outputs=outputs, x=x, batch=batch)
+        return outputs
 
     def _architecture_config(self) -> dict[str, Any]:
         return {

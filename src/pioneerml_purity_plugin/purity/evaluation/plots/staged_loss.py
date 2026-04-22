@@ -96,6 +96,78 @@ def _can_use_log_scale(values: Sequence[float]) -> bool:
     return bool(values) and all(math.isfinite(float(v)) and float(v) > 0.0 for v in values)
 
 
+def _extract_pdg_batch_histories(
+    *,
+    module: object | None = None,
+    split: str = "train",
+    histories: Sequence[Mapping[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    raw = histories
+    if raw is None and module is not None:
+        if str(split) == "val":
+            raw = getattr(module, "val_pdg_batch_accuracy_history", None)
+        else:
+            raw = getattr(module, "train_pdg_batch_accuracy_history", None)
+
+    out: list[dict[str, Any]] = []
+    if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes, bytearray)):
+        for index, item in enumerate(raw):
+            if not isinstance(item, Mapping):
+                continue
+            class_accuracy_raw = item.get("class_accuracy")
+            if not isinstance(class_accuracy_raw, Mapping):
+                class_accuracy_raw = {}
+            class_accuracy = {
+                str(key): float(value)
+                for key, value in dict(class_accuracy_raw).items()
+                if isinstance(value, (int, float))
+            }
+            if not class_accuracy and item.get("overall_accuracy") is None:
+                continue
+            out.append(
+                {
+                    "global_batch_index": int(item.get("global_batch_index", index)),
+                    "overall_accuracy": float(item.get("overall_accuracy", 0.0)),
+                    "class_accuracy": class_accuracy,
+                    "phase_index": item.get("phase_index"),
+                    "phase_name": item.get("phase_name"),
+                }
+            )
+    return out
+
+
+def _extract_pdg_phase_regions(
+    *,
+    module: object | None = None,
+    split: str = "train",
+) -> list[dict[str, Any]]:
+    raw = getattr(module, "staged_phase_pdg_histories", None) if module is not None else None
+    out: list[dict[str, Any]] = []
+    if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes, bytearray)):
+        cursor = 0
+        for idx, item in enumerate(raw, start=1):
+            if not isinstance(item, Mapping):
+                continue
+            if str(split) == "val":
+                count = int(item.get("val_batches", 0))
+            else:
+                count = int(item.get("train_batches", 0))
+            if count <= 0:
+                continue
+            start = int(cursor)
+            end = int(cursor + count)
+            cursor = end
+            out.append(
+                {
+                    "index": int(item.get("index", idx)),
+                    "name": str(item.get("name") or f"phase_{idx}"),
+                    "start": start,
+                    "end": end,
+                }
+            )
+    return out
+
+
 def _plot_single_phase_axis(
     *,
     ax,
@@ -225,6 +297,68 @@ class _PuritySinglePhaseLossCurvesPlot(BasePlot):
             title=phase_title,
             log_scale=bool(log_scale),
         )
+        fig.tight_layout()
+        return _save_and_show(fig=fig, save_path=save_path, show=show)
+
+
+@PLOT_REGISTRY_DEF.register("purity_pdg_accuracy_curves")
+class PurityPDGAccuracyCurvesPlot(BasePlot):
+    """Render per-batch node-PDG accuracy curves (overall + per class)."""
+
+    name = "purity_pdg_accuracy_curves"
+
+    def render(
+        self,
+        *,
+        module: object | None = None,
+        split: str = "train",
+        pdg_histories: Sequence[Mapping[str, Any]] | None = None,
+        title: str = "PURITY Node-PDG Accuracy (Per Batch)",
+        save_path: str | None = None,
+        show: bool = False,
+    ) -> str | None:
+        records = _extract_pdg_batch_histories(
+            module=module,
+            split=split,
+            histories=pdg_histories,
+        )
+        if not records:
+            return None
+
+        phase_regions = _extract_pdg_phase_regions(module=module, split=split)
+        x = [int(item["global_batch_index"]) for item in records]
+        overall = [float(item["overall_accuracy"]) for item in records]
+
+        class_names: list[str] = []
+        for item in records:
+            for name in dict(item.get("class_accuracy") or {}).keys():
+                if name not in class_names:
+                    class_names.append(str(name))
+
+        fig, ax = plt.subplots(figsize=(9.0, 4.0))
+        region_colors = ["#d9edf7", "#dff0d8", "#fcf8e3", "#f2dede", "#e9e7fd"]
+        y_max = 1.02
+        for idx, region in enumerate(phase_regions):
+            start = int(region["start"])
+            end = int(region["end"])
+            color = region_colors[idx % len(region_colors)]
+            ax.axvspan(start - 0.5, end - 0.5, color=color, alpha=0.24, lw=0)
+            center = (start + end - 1) / 2.0
+            ax.text(center, y_max - 0.01, str(region["name"]), ha="center", va="top", fontsize=8)
+
+        ax.plot(x, overall, label="overall", color="black", linewidth=2.0)
+        palette = ["tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple", "tab:brown"]
+        for idx, class_name in enumerate(class_names):
+            y = [float(dict(item.get("class_accuracy") or {}).get(class_name, float("nan"))) for item in records]
+            ax.plot(x, y, label=class_name, color=palette[idx % len(palette)], linewidth=1.5, alpha=0.95)
+
+        ax.set_ylim(0.0, y_max)
+        ax.set_xlim(-0.5, max(x) + 0.5)
+        ax.set_xlabel("Batch Index")
+        ax.set_ylabel("Accuracy")
+        ax.set_title(f"{title} [{str(split)}]")
+        ax.grid(True, alpha=0.2)
+        ax.legend(loc="lower right")
         fig.tight_layout()
         return _save_and_show(fig=fig, save_path=save_path, show=show)
 

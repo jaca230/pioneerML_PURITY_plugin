@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from .staged_loss import (
+    PurityPDGAccuracyCurvesPlot,
     PurityPhase1LossCurvesPlot,
     PurityPhase2LossCurvesPlot,
     PurityPhase3LossCurvesPlot,
@@ -18,18 +19,20 @@ def _wrap(cls) -> Callable[..., Any]:
 
 
 plot_purity_staged_loss_curves = _wrap(PurityStagedLossCurvesPlot)
+plot_purity_pdg_accuracy_curves = _wrap(PurityPDGAccuracyCurvesPlot)
 plot_purity_phase_1_loss_curves = _wrap(PurityPhase1LossCurvesPlot)
 plot_purity_phase_2_loss_curves = _wrap(PurityPhase2LossCurvesPlot)
 plot_purity_phase_3_loss_curves = _wrap(PurityPhase3LossCurvesPlot)
 
 __all__ = [
     "PurityStagedLossCurvesPlot",
+    "PurityPDGAccuracyCurvesPlot",
     "PurityPhase1LossCurvesPlot",
     "PurityPhase2LossCurvesPlot",
     "PurityPhase3LossCurvesPlot",
     "plot_purity_staged_loss_curves",
+    "plot_purity_pdg_accuracy_curves",
     "plot_purity_phase_1_loss_curves",
     "plot_purity_phase_2_loss_curves",
     "plot_purity_phase_3_loss_curves",
 ]
-

@@ -28,6 +28,7 @@ class PurityPhase:
     unfreeze_param_patterns: tuple[str, ...]
     trainer_kwargs: dict[str, Any] | None
     early_stopping: dict[str, Any] | None
+    optimizer_overrides: dict[str, float] | None
 
 
 @dataclass(frozen=True)
@@ -74,6 +75,7 @@ class PurityStagedTrainingStep(BaseFullTrainingStep):
             raise RuntimeError(f"{self.__class__.__name__} runtime_state has invalid 'upstream_payloads'.")
 
         staged_cfg = self._resolve_staged_training_config()
+        setattr(module, "_staged_training_current_phase", None)
         phase_summaries: list[dict[str, Any]] = []
         phase_loss_histories: list[dict[str, Any]] = []
         if not staged_cfg.enabled or len(staged_cfg.phases) == 0:
@@ -92,12 +94,17 @@ class PurityStagedTrainingStep(BaseFullTrainingStep):
                     # for debugging/validation and notebook visualization.
                     train_hist_before = len(list(getattr(module, "train_epoch_loss_history", []) or []))
                     val_hist_before = len(list(getattr(module, "val_epoch_loss_history", []) or []))
+                    train_pdg_before = len(list(getattr(module, "train_pdg_batch_accuracy_history", []) or []))
+                    val_pdg_before = len(list(getattr(module, "val_pdg_batch_accuracy_history", []) or []))
+                    setattr(module, "_staged_training_current_phase", {"index": int(phase_index), "name": str(phase.name)})
                     trainability = self._apply_phase_trainability(
                         module=module,
                         phase=phase,
                         strict_match=staged_cfg.strict_param_pattern_match,
                     )
                     self._apply_phase_task_weights(module=module, task_weights=phase.task_weights)
+                    self._warn_phase_task_weight_risks(phase=phase)
+                    self._apply_phase_optimizer_overrides(module=module, overrides=phase.optimizer_overrides)
                     phase_trainer = self._build_phase_trainer(phase=phase)
                     LOGGER.info(
                         "[purity_staged_training] phase=%s configured_max_epochs=%s",
@@ -113,6 +120,10 @@ class PurityStagedTrainingStep(BaseFullTrainingStep):
                     val_hist_full = list(getattr(module, "val_epoch_loss_history", []) or [])
                     phase_train_losses = [float(v) for v in train_hist_full[train_hist_before:]]
                     phase_val_losses = [float(v) for v in val_hist_full[val_hist_before:]]
+                    train_pdg_hist_full = list(getattr(module, "train_pdg_batch_accuracy_history", []) or [])
+                    val_pdg_hist_full = list(getattr(module, "val_pdg_batch_accuracy_history", []) or [])
+                    phase_train_pdg = [dict(v) for v in train_pdg_hist_full[train_pdg_before:]]
+                    phase_val_pdg = [dict(v) for v in val_pdg_hist_full[val_pdg_before:]]
                     LOGGER.info(
                         "[purity_staged_training] phase=%s train_loss_points=%s val_loss_points=%s",
                         phase.name,
@@ -125,6 +136,8 @@ class PurityStagedTrainingStep(BaseFullTrainingStep):
                             "name": str(phase.name),
                             "train_losses": phase_train_losses,
                             "val_losses": phase_val_losses,
+                            "train_pdg_accuracy": phase_train_pdg,
+                            "val_pdg_accuracy": phase_val_pdg,
                         }
                     )
                     phase_summaries.append(
@@ -137,13 +150,17 @@ class PurityStagedTrainingStep(BaseFullTrainingStep):
                                 else self._resolved_base_max_epochs()
                             ),
                             "task_weights": dict(phase.task_weights or {}),
+                            "optimizer_overrides": dict(phase.optimizer_overrides or {}),
                             "trainable_parameters": int(trainability["trainable_parameters"]),
                             "frozen_parameters": int(trainability["frozen_parameters"]),
                             "train_loss_points": len(phase_train_losses),
                             "val_loss_points": len(phase_val_losses),
+                            "train_pdg_batches": len(phase_train_pdg),
+                            "val_pdg_batches": len(phase_val_pdg),
                         }
                     )
             finally:
+                setattr(module, "_staged_training_current_phase", None)
                 if staged_cfg.reset_task_weights_after_training:
                     self._apply_phase_task_weights(module=module, task_weights=None)
                 if staged_cfg.restore_param_trainability_after_training:
@@ -152,6 +169,19 @@ class PurityStagedTrainingStep(BaseFullTrainingStep):
             # Persist on module so downstream notebook/debug tooling can render
             # one curve per staged phase without re-running training.
             setattr(module, "staged_phase_loss_histories", phase_loss_histories)
+            setattr(
+                module,
+                "staged_phase_pdg_histories",
+                [
+                    {
+                        "index": int(item.get("index", 0)),
+                        "name": str(item.get("name", "")),
+                        "train_batches": int(len(list(item.get("train_pdg_accuracy") or []))),
+                        "val_batches": int(len(list(item.get("val_pdg_accuracy") or []))),
+                    }
+                    for item in phase_loss_histories
+                ],
+            )
 
         if bool(train_params.get("log_diagnostics", False)):
             log_loader_diagnostics(label="train", loader_provider=train_provider)
@@ -241,6 +271,10 @@ class PurityStagedTrainingStep(BaseFullTrainingStep):
             phase.get("early_stopping"),
             context=f"{context}.early_stopping",
         )
+        optimizer_overrides = PurityStagedTrainingStep._normalize_optional_float_mapping(
+            phase.get("optimizer_overrides"),
+            context=f"{context}.optimizer_overrides",
+        )
         trainable_patterns = PurityStagedTrainingStep._normalize_optional_string_list(
             phase.get("trainable_param_patterns"),
             context=f"{context}.trainable_param_patterns",
@@ -264,6 +298,7 @@ class PurityStagedTrainingStep(BaseFullTrainingStep):
             unfreeze_param_patterns=tuple(unfreeze_patterns),
             trainer_kwargs=trainer_kwargs,
             early_stopping=early_stopping,
+            optimizer_overrides=optimizer_overrides,
         )
 
     @staticmethod
@@ -398,6 +433,52 @@ class PurityStagedTrainingStep(BaseFullTrainingStep):
             LOGGER.warning(
                 "Module %s does not expose set_task_weights(); staged task_weights were ignored.",
                 type(module).__name__,
+            )
+
+    @staticmethod
+    def _apply_phase_optimizer_overrides(*, module, overrides: Mapping[str, float] | None) -> None:
+        if not overrides:
+            return
+        setter = getattr(module, "set_optimizer_hyperparams", None)
+        if callable(setter):
+            kwargs: dict[str, float] = {}
+            if "lr" in overrides:
+                kwargs["lr"] = float(overrides["lr"])
+            if "weight_decay" in overrides:
+                kwargs["weight_decay"] = float(overrides["weight_decay"])
+            if kwargs:
+                setter(**kwargs)
+                LOGGER.info(
+                    "[purity_staged_training] optimizer_overrides applied: %s",
+                    {k: float(v) for k, v in kwargs.items()},
+                )
+            return
+        LOGGER.warning(
+            "Module %s does not expose set_optimizer_hyperparams(); optimizer_overrides were ignored.",
+            type(module).__name__,
+        )
+
+    @staticmethod
+    def _warn_phase_task_weight_risks(*, phase: PurityPhase) -> None:
+        task_weights = dict(phase.task_weights or {})
+        if len(task_weights) == 0:
+            return
+        w_event = float(task_weights.get("w_event_builder", 0.0) or 0.0)
+        w_lyso = float(task_weights.get("w_lyso_condensation", 0.0) or 0.0)
+        if w_event > 0.0 and w_lyso <= 0.0:
+            LOGGER.warning(
+                "[purity_staged_training] phase=%s sets w_event_builder>0 but w_lyso_condensation<=0. "
+                "Event-builder loss may collapse to near-zero because LYSO assignments are disabled.",
+                phase.name,
+            )
+
+        w_node = float(task_weights.get("w_node_pdg", 0.0) or 0.0)
+        w_slice = float(task_weights.get("w_slice_pdg", 0.0) or 0.0)
+        if w_node <= 0.0 and w_slice <= 0.0:
+            LOGGER.warning(
+                "[purity_staged_training] phase=%s disables both node and slice PDG objectives; "
+                "classification accuracy can drift in this phase.",
+                phase.name,
             )
 
     def _build_phase_trainer(self, *, phase: PurityPhase):

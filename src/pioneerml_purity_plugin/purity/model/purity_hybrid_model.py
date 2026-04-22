@@ -760,15 +760,17 @@ class PurityHybridModel(nn.Module):
             count_x.index_add_(0, global_slice_idx_x, torch.ones_like(global_slice_idx_x, dtype=torch.float).unsqueeze(1))
             count_y.index_add_(0, global_slice_idx_y, torch.ones_like(global_slice_idx_y, dtype=torch.float).unsqueeze(1))
 
-            has_x = (count_x > 0).squeeze()
-            has_y = (count_y > 0).squeeze()
+            # Keep masks explicitly 1D for single-slice/single-event batches.
+            # `squeeze()` can collapse to 0D and break later `unsqueeze(1)`.
+            has_x = (count_x > 0).view(-1)
+            has_y = (count_y > 0).view(-1)
 
             # Bring back has_x to unsqueezed for math
             has_x_f = has_x.float().unsqueeze(1)
             has_y_f = has_y.float().unsqueeze(1)
             
             # Combine X and Y 
-            valid_slice_mask = ((has_x_f + has_y_f) > 0).squeeze() # Slices that actually have ATAR hits
+            valid_slice_mask = ((has_x_f + has_y_f) > 0).view(-1) # Slices that actually have ATAR hits
             output['valid_slice_mask'] = valid_slice_mask
             
             # --- PHASE 1: Evaluate Node-Level Predictions First! ---
@@ -1796,116 +1798,5 @@ class PurityHybridModel(nn.Module):
 
             output['unified_event_logits'] = event_logits
             output['unified_token_batch'] = unified_batch
-
-        # === EVENT SUMMARY (non-trained aggregator) ===
-        # Collects existing predictions into a per-event summary. Missing fields
-        # use SENTINEL = -999.0. Acceptance mirrors pileup_mixer.py:146-153:
-        # fiducial_z in [1.2, 4.8] mm, |x|<8, |y|<8, polar angle < 120°.
-        SENTINEL = -999.0
-        B = num_graphs_in_batch
-        device = x.device
-
-        pion_stop = output.get('atar_pion_stop')
-        if pion_stop is None:
-            pion_stop = torch.full((B, 3), SENTINEL, device=device)
-
-        positron_dir = output.get('atar_positron_dir')
-        if positron_dir is None:
-            positron_dir = torch.full((B, 3), SENTINEL, device=device)
-            polar_angle = torch.full((B,), SENTINEL, device=device)
-        else:
-            cos_theta = positron_dir[:, 2].clamp(-1.0, 1.0)
-            polar_angle = torch.acos(cos_theta)  # radians
-
-        pos_time = output.get('positron_time_per_graph')
-        if pos_time is None:
-            pos_time = torch.full((B,), SENTINEL, device=device)
-
-        # Positron energy: ATAR positron-hit E + triggered LYSO cluster-hit E.
-        pos_energy = torch.zeros(B, device=device)
-        has_any = False
-
-        # ATAR contribution
-        trig_p = output.get('atar_hit_trigger_prob')
-        mip_p = output.get('atar_hit_mip_prob')
-        if trig_p is not None and mip_p is not None and is_atar.any():
-            pos_mask = ((trig_p > 0.5) & (mip_p > 0.5)).float()
-            batch_atar = batch[is_atar]
-            e_atar = x[is_atar, 3]
-            pos_energy.index_add_(0, batch_atar, e_atar * pos_mask)
-            has_any = True
-
-        # LYSO contribution: per-hit trigger prob via assignment-weighted mixture
-        # p_hit_i = Σ_k(w_ik · β_k · p_k) / Σ_k(w_ik · β_k); hit counted if p_hit > 0.5
-        w_lyso = output.get('lyso_soft_assignments')
-        beta_lyso = output.get('lyso_seed_beta')
-        ev_logits = output.get('unified_event_logits')
-        n_atar_tok = unified_num_atar_tokens
-        if (is_lyso.any() and w_lyso is not None and beta_lyso is not None
-                and ev_logits is not None):
-            K = w_lyso.size(1)
-            lyso_p = torch.sigmoid(ev_logits[n_atar_tok:].view(-1))  # [Total_K]
-            beta_bk = beta_lyso.view(-1, K)
-            # TorchScript/trace can emit token counts that are not perfectly divisible by K.
-            # Keep only full K-blocks and align with available beta rows.
-            lyso_blocks = int(lyso_p.numel()) // int(K)
-            beta_blocks = int(beta_bk.size(0))
-            usable_blocks = min(lyso_blocks, beta_blocks)
-            if usable_blocks <= 0:
-                beta_bk = beta_bk[:0]
-                p_bk = lyso_p.new_zeros((0, int(K)))
-            else:
-                p_bk = lyso_p[: usable_blocks * int(K)].view(usable_blocks, int(K))
-                beta_bk = beta_bk[:usable_blocks]
-            # Rebuild has_lyso -> valid-graph mapping
-            hit_graph = batch[is_lyso]
-            counts = torch.zeros(B, device=device, dtype=torch.long)
-            counts.index_add_(0, hit_graph, torch.ones_like(hit_graph))
-            has_lyso_g = counts > 0
-            graph_to_valid = torch.full((B,), -1, device=device, dtype=torch.long)
-            graph_to_valid[has_lyso_g] = torch.arange(
-                int(has_lyso_g.sum().item()), device=device)
-            hit_vg = graph_to_valid[hit_graph]  # [N_lyso]
-            valid_vg = (hit_vg >= 0) & (hit_vg < int(usable_blocks))
-            if bool(valid_vg.any().item()):
-                hit_vg_valid = hit_vg[valid_vg]
-                w_lyso_valid = w_lyso[valid_vg]
-                wb = w_lyso_valid * beta_bk[hit_vg_valid]  # [N_valid_lyso, K]
-                wb_sum = wb.sum(dim=1).clamp(min=1e-6)
-                p_hit_valid = (wb * p_bk[hit_vg_valid]).sum(dim=1) / wb_sum  # [N_valid_lyso]
-                p_hit = torch.zeros_like(hit_vg, dtype=torch.float32)
-                p_hit[valid_vg] = p_hit_valid
-                output['lyso_hit_trigger_prob'] = p_hit.detach()
-                lyso_mask = (p_hit > 0.5).float()
-                e_lyso = x[is_lyso, 3]
-                pos_energy.index_add_(0, hit_graph, e_lyso * lyso_mask)
-                has_any = True
-
-        if not has_any:
-            pos_energy = torch.full((B,), SENTINEL, device=device)
-
-        # Acceptance decision based on predicted quantities.
-        ps_raw = pion_stop * self.norm_pos_atar
-        fiducial = (
-            (ps_raw[:, 2] > self.accept_z_min_mm) & (ps_raw[:, 2] < self.accept_z_max_mm) &
-            (ps_raw[:, 0].abs() < self.accept_xy_max_mm) & (ps_raw[:, 1].abs() < self.accept_xy_max_mm)
-        )
-        angle_ok = positron_dir[:, 2] > self.accept_angle_cos
-        accepted = (fiducial & angle_ok).float()
-
-        output['summary_accepted'] = accepted.detach()
-        output['summary_positron_energy'] = pos_energy.detach()
-        output['summary_positron_time'] = pos_time.detach()
-        output['summary_positron_polar_angle'] = polar_angle.detach()
-
-        if not torch.jit.is_scripting():
-            output['event_summary'] = {
-                'pion_stop': pion_stop.detach(),
-                'positron_dir': positron_dir.detach(),
-                'positron_polar_angle': polar_angle.detach(),
-                'positron_time': pos_time.detach(),
-                'positron_energy': pos_energy.detach(),
-                'accepted': accepted.detach(),
-            }
 
         return output

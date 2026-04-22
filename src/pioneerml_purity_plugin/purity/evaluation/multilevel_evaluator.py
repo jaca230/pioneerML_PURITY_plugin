@@ -30,7 +30,7 @@ class PurityMultiLevelEvaluator(BaseEvaluator):
     """Multi-head evaluator that reports aggregated multi-task loss terms."""
 
     default_metric_names: tuple[str, ...] = ()
-    default_plot_names: tuple[str, ...] = ("loss_curves",)
+    default_plot_names: tuple[str, ...] = ("loss_curves", "purity_pdg_accuracy_curves")
 
     def build_context(
         self,
@@ -114,6 +114,7 @@ class PurityMultiLevelEvaluator(BaseEvaluator):
         phase1_plot_path = None
         phase2_plot_path = None
         phase3_plot_path = None
+        pdg_plot_path = None
         if plot_path is not None:
             plot_file = Path(str(plot_path))
             parent = plot_file.parent
@@ -123,12 +124,14 @@ class PurityMultiLevelEvaluator(BaseEvaluator):
             phase1_plot_path = str(parent / f"{stem}_phase1{suffix}")
             phase2_plot_path = str(parent / f"{stem}_phase2{suffix}")
             phase3_plot_path = str(parent / f"{stem}_phase3{suffix}")
+            pdg_plot_path = str(parent / f"{stem}_pdg_accuracy{suffix}")
         elif isinstance(plot_dir, str) and plot_dir.strip():
             parent = Path(plot_dir)
             staged_plot_path = str(parent / "purity_staged_loss_curves.png")
             phase1_plot_path = str(parent / "purity_phase_1_loss_curves.png")
             phase2_plot_path = str(parent / "purity_phase_2_loss_curves.png")
             phase3_plot_path = str(parent / "purity_phase_3_loss_curves.png")
+            pdg_plot_path = str(parent / "purity_pdg_accuracy_curves.png")
 
         return {
             "metric_context": {},
@@ -157,7 +160,13 @@ class PurityMultiLevelEvaluator(BaseEvaluator):
                     "module": module,
                     "save_path": phase3_plot_path,
                     "show": False,
-                }
+                },
+                "purity_pdg_accuracy_curves": {
+                    "module": module,
+                    "split": "train",
+                    "save_path": pdg_plot_path,
+                    "show": False,
+                },
             },
             "base_metrics": base_metrics,
         }
@@ -174,4 +183,7 @@ class PurityMultiLevelEvaluator(BaseEvaluator):
         loss_plot_path = results.get("loss_curves_path")
         if isinstance(loss_plot_path, str):
             results["loss_plot_path"] = loss_plot_path
+        pdg_plot_path = results.get("purity_pdg_accuracy_curves_path")
+        if isinstance(pdg_plot_path, str):
+            results["pdg_accuracy_plot_path"] = pdg_plot_path
         return results
