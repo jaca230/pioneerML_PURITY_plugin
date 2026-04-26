@@ -185,6 +185,7 @@ class PurityModel(BaseGraphClassifierModel):
         num_blocks: int | None = None,
         dropout: float = 0.05,
         num_pdg_classes: int = 3,
+        use_teacher_forcing_gates: bool = True,
     ):
         resolved_blocks = int(layers) if num_blocks is None else int(num_blocks)
         super().__init__(
@@ -198,6 +199,7 @@ class PurityModel(BaseGraphClassifierModel):
         self.heads = int(heads)
         self.num_blocks = int(resolved_blocks)
         self.num_pdg_classes = int(num_pdg_classes)
+        self.use_teacher_forcing_gates = bool(use_teacher_forcing_gates)
 
         self.impl = PurityHybridModel(
             hidden_dim=int(hidden),
@@ -205,6 +207,7 @@ class PurityModel(BaseGraphClassifierModel):
             heads=int(heads),
             dropout=float(dropout),
             num_pdg_classes=int(num_pdg_classes),
+            use_teacher_forcing_gates=bool(use_teacher_forcing_gates),
         )
 
     @staticmethod
@@ -235,7 +238,7 @@ class PurityModel(BaseGraphClassifierModel):
         _ = edge_attr
         if isinstance(data_or_x, Data):
             x_node, node_graph_id = self._resolve_batch_input(data_or_x)
-            return self.forward_tensors(x_node, node_graph_id, task_weights=task_weights)
+            return self.forward_tensors(x_node, node_graph_id, task_weights=task_weights, data=data_or_x)
 
         resolved_batch: torch.Tensor | None = batch
         # Support both `(x, batch)` and `(x, edge_index, edge_attr, batch)` call styles.
@@ -378,6 +381,7 @@ class PurityModel(BaseGraphClassifierModel):
         x: torch.Tensor,
         batch: torch.Tensor,
         task_weights: dict[str, float] | None = None,
+        data: Data | None = None,
     ) -> dict[str, torch.Tensor]:
         # Inference path: if no explicit staged weights are provided, run the
         # full fused task set so event-summary heads are active.
@@ -390,7 +394,23 @@ class PurityModel(BaseGraphClassifierModel):
                 "w_positron_angle": 1.0,
                 "w_lyso_condensation": 0.5,
             }
-        outputs = self.impl(x, batch, task_weights=task_weights)
+        teacher_is_trigger: torch.Tensor | None = None
+        teacher_node_pdg: torch.Tensor | None = None
+        if self.training and self.use_teacher_forcing_gates and isinstance(data, Data):
+            maybe_trigger = getattr(data, "is_trigger_target", None)
+            if isinstance(maybe_trigger, torch.Tensor):
+                teacher_is_trigger = maybe_trigger
+            maybe_node_pdg = getattr(data, "atar_node_pdg_target", None)
+            if isinstance(maybe_node_pdg, torch.Tensor):
+                teacher_node_pdg = maybe_node_pdg
+
+        outputs = self.impl(
+            x,
+            batch,
+            task_weights=task_weights,
+            teacher_is_trigger=teacher_is_trigger,
+            teacher_node_pdg=teacher_node_pdg,
+        )
         if not self.training:
             outputs = self._attach_inference_summary(outputs=outputs, x=x, batch=batch)
         return outputs
@@ -405,6 +425,7 @@ class PurityModel(BaseGraphClassifierModel):
             "layers": int(self.num_blocks),
             "dropout": float(self.dropout),
             "num_pdg_classes": int(self.num_pdg_classes),
+            "use_teacher_forcing_gates": bool(self.use_teacher_forcing_gates),
         }
 
     @staticmethod

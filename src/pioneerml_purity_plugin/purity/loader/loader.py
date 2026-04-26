@@ -76,6 +76,7 @@ class PurityGraphLoader(MultiLevelGraphLoader):
                     "truth_pion_stop_z",
                 )
             ),
+            debug_epoch_batch_summary=bool(params.get("debug_epoch_batch_summary", False)),
             stage_overrides=stage_overrides if isinstance(stage_overrides, dict) else None,
             stage_observer=stage_observer if isinstance(stage_observer, StageObserver) else None,
             profiling=profiling,
@@ -111,6 +112,7 @@ class PurityGraphLoader(MultiLevelGraphLoader):
             "truth_pion_stop_y",
             "truth_pion_stop_z",
         ),
+        debug_epoch_batch_summary: bool = False,
         stage_overrides: dict[str, BaseStage] | None = None,
         stage_observer: StageObserver | None = None,
         profiling: dict | None = None,
@@ -132,6 +134,7 @@ class PurityGraphLoader(MultiLevelGraphLoader):
             for col in (guard_require_finite_scalars or [])
             if str(col).strip() != ""
         )
+        self.debug_epoch_batch_summary_enabled = bool(debug_epoch_batch_summary)
 
         self.graph_dims = graph_dims or GraphTensorDims(
             node_feature_dim=int(self.NODE_FEATURE_DIM),

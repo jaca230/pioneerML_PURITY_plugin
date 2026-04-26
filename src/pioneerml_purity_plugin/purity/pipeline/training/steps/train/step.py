@@ -96,6 +96,10 @@ class PurityStagedTrainingStep(BaseFullTrainingStep):
                     val_hist_before = len(list(getattr(module, "val_epoch_loss_history", []) or []))
                     train_pdg_before = len(list(getattr(module, "train_pdg_batch_accuracy_history", []) or []))
                     val_pdg_before = len(list(getattr(module, "val_pdg_batch_accuracy_history", []) or []))
+                    train_endpoint_before = len(list(getattr(module, "train_endpoint_mse_batch_history", []) or []))
+                    val_endpoint_before = len(list(getattr(module, "val_endpoint_mse_batch_history", []) or []))
+                    train_task_before = len(list(getattr(module, "train_task_diagnostics_batch_history", []) or []))
+                    val_task_before = len(list(getattr(module, "val_task_diagnostics_batch_history", []) or []))
                     setattr(module, "_staged_training_current_phase", {"index": int(phase_index), "name": str(phase.name)})
                     trainability = self._apply_phase_trainability(
                         module=module,
@@ -122,8 +126,16 @@ class PurityStagedTrainingStep(BaseFullTrainingStep):
                     phase_val_losses = [float(v) for v in val_hist_full[val_hist_before:]]
                     train_pdg_hist_full = list(getattr(module, "train_pdg_batch_accuracy_history", []) or [])
                     val_pdg_hist_full = list(getattr(module, "val_pdg_batch_accuracy_history", []) or [])
+                    train_endpoint_hist_full = list(getattr(module, "train_endpoint_mse_batch_history", []) or [])
+                    val_endpoint_hist_full = list(getattr(module, "val_endpoint_mse_batch_history", []) or [])
+                    train_task_hist_full = list(getattr(module, "train_task_diagnostics_batch_history", []) or [])
+                    val_task_hist_full = list(getattr(module, "val_task_diagnostics_batch_history", []) or [])
                     phase_train_pdg = [dict(v) for v in train_pdg_hist_full[train_pdg_before:]]
                     phase_val_pdg = [dict(v) for v in val_pdg_hist_full[val_pdg_before:]]
+                    phase_train_endpoint = [dict(v) for v in train_endpoint_hist_full[train_endpoint_before:]]
+                    phase_val_endpoint = [dict(v) for v in val_endpoint_hist_full[val_endpoint_before:]]
+                    phase_train_task = [dict(v) for v in train_task_hist_full[train_task_before:]]
+                    phase_val_task = [dict(v) for v in val_task_hist_full[val_task_before:]]
                     LOGGER.info(
                         "[purity_staged_training] phase=%s train_loss_points=%s val_loss_points=%s",
                         phase.name,
@@ -138,6 +150,10 @@ class PurityStagedTrainingStep(BaseFullTrainingStep):
                             "val_losses": phase_val_losses,
                             "train_pdg_accuracy": phase_train_pdg,
                             "val_pdg_accuracy": phase_val_pdg,
+                            "train_endpoint_mse": phase_train_endpoint,
+                            "val_endpoint_mse": phase_val_endpoint,
+                            "train_task_diagnostics": phase_train_task,
+                            "val_task_diagnostics": phase_val_task,
                         }
                     )
                     phase_summaries.append(
@@ -157,6 +173,10 @@ class PurityStagedTrainingStep(BaseFullTrainingStep):
                             "val_loss_points": len(phase_val_losses),
                             "train_pdg_batches": len(phase_train_pdg),
                             "val_pdg_batches": len(phase_val_pdg),
+                            "train_endpoint_batches": len(phase_train_endpoint),
+                            "val_endpoint_batches": len(phase_val_endpoint),
+                            "train_task_batches": len(phase_train_task),
+                            "val_task_batches": len(phase_val_task),
                         }
                     )
             finally:
@@ -178,6 +198,32 @@ class PurityStagedTrainingStep(BaseFullTrainingStep):
                         "name": str(item.get("name", "")),
                         "train_batches": int(len(list(item.get("train_pdg_accuracy") or []))),
                         "val_batches": int(len(list(item.get("val_pdg_accuracy") or []))),
+                    }
+                    for item in phase_loss_histories
+                ],
+            )
+            setattr(
+                module,
+                "staged_phase_endpoint_histories",
+                [
+                    {
+                        "index": int(item.get("index", 0)),
+                        "name": str(item.get("name", "")),
+                        "train_batches": int(len(list(item.get("train_endpoint_mse") or []))),
+                        "val_batches": int(len(list(item.get("val_endpoint_mse") or []))),
+                    }
+                    for item in phase_loss_histories
+                ],
+            )
+            setattr(
+                module,
+                "staged_phase_task_histories",
+                [
+                    {
+                        "index": int(item.get("index", 0)),
+                        "name": str(item.get("name", "")),
+                        "train_batches": int(len(list(item.get("train_task_diagnostics") or []))),
+                        "val_batches": int(len(list(item.get("val_task_diagnostics") or []))),
                     }
                     for item in phase_loss_histories
                 ],

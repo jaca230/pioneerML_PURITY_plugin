@@ -761,6 +761,53 @@ def format_targets_from_batch(batch):
         raise AttributeError("batch is missing node features (expected `x` or `x_node`).")
     is_lyso_all = (x_all[:, 7] > 0.5)
     is_atar_all = ~is_lyso_all
+    num_graphs = int(batch.batch.max().item()) + 1 if hasattr(batch, "batch") and int(batch.batch.numel()) > 0 else 0
+
+    def _slice_batch_index(*, n_slices: int, device: torch.device) -> torch.Tensor:
+        """Resolve ATAR-slice -> graph index mapping robustly across loader backends."""
+        if int(n_slices) <= 0:
+            return torch.zeros((0,), dtype=torch.long, device=device)
+        if num_graphs <= 0:
+            return torch.zeros((int(n_slices),), dtype=torch.long, device=device)
+
+        # Preferred path for structured loader batches.
+        slice_graph_id = getattr(batch, "slice_graph_id", None)
+        if isinstance(slice_graph_id, torch.Tensor) and int(slice_graph_id.numel()) >= int(n_slices):
+            out = slice_graph_id.view(-1)[: int(n_slices)].to(device=device, dtype=torch.long)
+            return out.clamp(min=0, max=max(0, num_graphs - 1))
+
+        # Pointer-based fallback (also present in structured loader batches).
+        atar_slice_ptr = getattr(batch, "atar_slice_ptr", None)
+        if isinstance(atar_slice_ptr, torch.Tensor) and int(atar_slice_ptr.numel()) >= 2:
+            ptr = atar_slice_ptr.view(-1).to(device=device, dtype=torch.long)
+            out = torch.zeros((int(n_slices),), dtype=torch.long, device=device)
+            g_max = min(max(0, num_graphs), int(ptr.numel()) - 1)
+            for g in range(g_max):
+                s0 = int(ptr[g].item())
+                s1 = int(ptr[g + 1].item())
+                s0 = max(0, min(int(n_slices), s0))
+                s1 = max(0, min(int(n_slices), s1))
+                if s1 > s0:
+                    out[s0:s1] = g
+            return out
+
+        # Legacy PyG batch metadata fallback.
+        out = torch.zeros((int(n_slices),), dtype=torch.long, device=device)
+        if hasattr(batch, "_slice_dict") and isinstance(batch._slice_dict, dict):
+            for key in ("atar_pion_stop_target", "atar_angle_target", "atar_slice_pdg_target"):
+                slices = batch._slice_dict.get(key)
+                if isinstance(slices, torch.Tensor) and int(slices.numel()) >= 2:
+                    slices = slices.view(-1).to(device=device, dtype=torch.long)
+                    g_max = min(max(0, num_graphs), int(slices.numel()) - 1)
+                    for g in range(g_max):
+                        s0 = int(slices[g].item())
+                        s1 = int(slices[g + 1].item())
+                        s0 = max(0, min(int(n_slices), s0))
+                        s1 = max(0, min(int(n_slices), s1))
+                        if s1 > s0:
+                            out[s0:s1] = g
+                    return out
+        return out
 
     # Node Level Targets
     if hasattr(batch, 'atar_node_pdg_target') and batch.atar_node_pdg_target is not None:
@@ -782,12 +829,10 @@ def format_targets_from_batch(batch):
             targets['tar_pion_stop_z'] = batch.atar_pion_stop_target[:, 2]
             # Per-graph pion stop: take first slice's target per graph (all copies identical)
             from torch_geometric.utils import scatter
-            slice_batch = batch.atar_slice_pdg_target.new_zeros(batch.atar_pion_stop_target.size(0), dtype=torch.long)
-            if hasattr(batch, '_slice_dict') and 'atar_pion_stop_target' in batch._slice_dict:
-                slices = batch._slice_dict['atar_pion_stop_target']
-                for g in range(len(slices) - 1):
-                    slice_batch[slices[g]:slices[g+1]] = g
-            num_graphs = batch.batch.max().item() + 1
+            slice_batch = _slice_batch_index(
+                n_slices=int(batch.atar_pion_stop_target.size(0)),
+                device=batch.atar_pion_stop_target.device,
+            )
             targets['tar_pion_stop_xyz'] = scatter(batch.atar_pion_stop_target, slice_batch, dim=0, dim_size=num_graphs, reduce='mean')
             if hasattr(batch, 'atar_pion_stop_valid_target') and batch.atar_pion_stop_valid_target is not None:
                 valid_slice = batch.atar_pion_stop_valid_target.float().view(-1)
@@ -799,12 +844,10 @@ def format_targets_from_batch(batch):
         targets['tar_angle_vec'] = batch.atar_angle_target.float()
         # Per-graph angle: take first slice's target per graph (all copies identical)
         if batch.atar_angle_target.dim() == 2 and batch.atar_angle_target.size(0) > 0:
-            angle_batch = batch.atar_angle_target.new_zeros(batch.atar_angle_target.size(0), dtype=torch.long)
-            if hasattr(batch, '_slice_dict') and 'atar_angle_target' in batch._slice_dict:
-                slices = batch._slice_dict['atar_angle_target']
-                for g in range(len(slices) - 1):
-                    angle_batch[slices[g]:slices[g+1]] = g
-            num_graphs = batch.batch.max().item() + 1
+            angle_batch = _slice_batch_index(
+                n_slices=int(batch.atar_angle_target.size(0)),
+                device=batch.atar_angle_target.device,
+            )
             targets['tar_angle_vec_per_graph'] = scatter(batch.atar_angle_target, angle_batch, dim=0, dim_size=num_graphs, reduce='mean')
         
     #if hasattr(batch, 'atar_endpoint_target') and batch.atar_endpoint_target is not None:

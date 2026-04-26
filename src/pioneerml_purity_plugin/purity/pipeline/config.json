@@ -10,7 +10,8 @@
           "hidden": 150,
           "heads": 5,
           "layers": 3,
-          "dropout": 0.05
+          "dropout": 0.05,
+          "use_teacher_forcing_gates": true
         }
       },
       "module": {
@@ -84,6 +85,12 @@
           }
         }
       },
+      "compiler": {
+        "type": "torch_compile",
+        "config": {
+          "enabled": false
+        }
+      },
       "loader_manager": {
         "config": {
           "input_sources_spec": {
@@ -98,9 +105,9 @@
           "defaults": {
             "type": "purity",
             "config": {
-              "batch_size": null,
+              "batch_size": 32,
               "mode": "train",
-              "chunk_row_groups": 4,
+              "chunk_row_groups": 8,
               "chunk_workers": 0,
               "edge_template_cache_enabled": false,
               "edge_template_cache_max_entries": null,
@@ -114,7 +121,11 @@
               "atar_time_norm": 500.0,
               "lyso_pos_norm": 100.0,
               "lyso_energy_norm": 70.0,
-              "lyso_time_norm": 500.0
+              "lyso_time_norm": 500.0,
+              "worker_start_method": "spawn",
+              "persistent_workers": false,
+              "prefetch_factor": 1,
+              "torch_sharing_strategy": "file_system"
             }
           },
           "loaders": {
@@ -123,6 +134,8 @@
                 "mode": "train",
                 "split": "train",
                 "shuffle_batches": true,
+                "drop_remainders": false,
+                "debug_epoch_batch_summary": true,
                 "log_diagnostics": false
               }
             },
@@ -131,6 +144,7 @@
                 "mode": "train",
                 "split": "val",
                 "shuffle_batches": false,
+                "drop_remainders": false,
                 "log_diagnostics": false
               }
             }
@@ -212,7 +226,8 @@
           "hidden": 150,
           "heads": 5,
           "layers": 3,
-          "dropout": 0.05
+          "dropout": 0.05,
+          "use_teacher_forcing_gates": true
         }
       },
       "module": {
@@ -286,6 +301,12 @@
           }
         }
       },
+      "compiler": {
+        "type": "torch_compile",
+        "config": {
+          "enabled": false
+        }
+      },
       "staged_training": {
         "enabled": true,
         "strict_param_pattern_match": false,
@@ -356,7 +377,7 @@
               "w_atar_trigger_slice": 0.5,
               "w_pion_kinematics": 0.25,
               "w_endpoints": 0.025,
-              "w_positron_angle": 0.5,
+              "w_positron_angle": 1.0,
               "w_lyso_condensation": 0.25,
               "w_positron_energy": 0.0,
               "w_event_builder": 0.0
@@ -382,7 +403,7 @@
               "w_atar_trigger_slice": 0.5,
               "w_pion_kinematics": 0.25,
               "w_endpoints": 0.025,
-              "w_positron_angle": 0.5,
+              "w_positron_angle": 1.0,
               "w_lyso_condensation": 0.25,
               "w_positron_energy": 0.0,
               "w_event_builder": 0.1
@@ -412,9 +433,9 @@
           "defaults": {
             "type": "purity",
             "config": {
-              "batch_size": null,
+              "batch_size": 128,
               "mode": "train",
-              "chunk_row_groups": 4,
+              "chunk_row_groups": 8,
               "chunk_workers": 0,
               "edge_template_cache_enabled": false,
               "edge_template_cache_max_entries": null,
@@ -428,7 +449,11 @@
               "atar_time_norm": 500.0,
               "lyso_pos_norm": 100.0,
               "lyso_energy_norm": 70.0,
-              "lyso_time_norm": 500.0
+              "lyso_time_norm": 500.0,
+              "worker_start_method": "spawn",
+              "persistent_workers": false,
+              "prefetch_factor": 1,
+              "torch_sharing_strategy": "file_system"
             }
           },
           "loaders": {
@@ -437,6 +462,8 @@
                 "mode": "train",
                 "split": "train",
                 "shuffle_batches": true,
+                "drop_remainders": true,
+                "debug_epoch_batch_summary": true,
                 "log_diagnostics": false
               }
             },
@@ -445,6 +472,7 @@
                 "mode": "train",
                 "split": "val",
                 "shuffle_batches": false,
+                "drop_remainders": false,
                 "log_diagnostics": false
               }
             }
@@ -464,6 +492,8 @@
             "loss_curves",
             "purity_staged_loss_curves",
             "purity_pdg_accuracy_curves",
+            "purity_endpoint_mse_curves",
+            "purity_endpoint_mse_by_particle_curves",
             "purity_phase_1_loss_curves",
             "purity_phase_2_loss_curves",
             "purity_phase_3_loss_curves"
@@ -507,6 +537,7 @@
                 "mode": "train",
                 "split": "test",
                 "shuffle_batches": false,
+                "drop_remainders": false,
                 "log_diagnostics": false
               }
             }
@@ -558,6 +589,7 @@
                 "mode": "train",
                 "split": "test",
                 "shuffle_batches": false,
+                "drop_remainders": false,
                 "log_diagnostics": false
               }
             }

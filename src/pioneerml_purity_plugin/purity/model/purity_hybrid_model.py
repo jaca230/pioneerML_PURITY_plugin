@@ -240,8 +240,15 @@ class PurityHybridModel(nn.Module):
     """
     The master unified model combining ATAR tracking and LYSO object condensation.
     """
-    def __init__(self, hidden_dim=150, num_blocks=3, heads=5,
-                 dropout=0.05, num_pdg_classes=3):
+    def __init__(
+        self,
+        hidden_dim=150,
+        num_blocks=3,
+        heads=5,
+        dropout=0.05,
+        num_pdg_classes=3,
+        use_teacher_forcing_gates: bool = True,
+    ):
         super().__init__()
         self.norm_t_lyso = float(NORM_T_LYSO)
         self.norm_e_lyso = float(NORM_E_LYSO)
@@ -252,6 +259,7 @@ class PurityHybridModel(nn.Module):
         self.accept_z_max_mm = float(ACCEPT_Z_MAX_MM)
         self.accept_xy_max_mm = float(ACCEPT_XY_MAX_MM)
         self.accept_angle_cos = float(_ACCEPT_ANGLE_COS)
+        self.use_teacher_forcing_gates = bool(use_teacher_forcing_gates)
 
         # --- Subsystem-aware encoders with clean, physically-motivated feature sets ---
         #
@@ -523,7 +531,14 @@ class PurityHybridModel(nn.Module):
             return float(task_weights[key])
         return float(default)
 
-    def forward(self, x, batch, task_weights: Optional[Dict[str, float]] = None):
+    def forward(
+        self,
+        x,
+        batch,
+        task_weights: Optional[Dict[str, float]] = None,
+        teacher_is_trigger: Optional[torch.Tensor] = None,
+        teacher_node_pdg: Optional[torch.Tensor] = None,
+    ):
         """
         x: [N_total_hits, 6] (features + modality_idx)
         batch: [N_total_hits] PyG batch index
@@ -541,6 +556,24 @@ class PurityHybridModel(nn.Module):
         is_atar_y = (x[:, 6] > 0.5)
         is_atar = is_atar_x | is_atar_y
         is_lyso = (x[:, 7] > 0.5)
+        num_atar_hits = int(is_atar.sum().item())
+        use_teacher_forcing = bool(self.training and self.use_teacher_forcing_gates)
+
+        teacher_trigger_atar: Optional[torch.Tensor] = None
+        teacher_node_pdg_atar: Optional[torch.Tensor] = None
+        if use_teacher_forcing and num_atar_hits > 0:
+            if isinstance(teacher_is_trigger, torch.Tensor):
+                trig = teacher_is_trigger.view(-1).to(dtype=torch.float32, device=x.device)
+                if int(trig.numel()) == int(x.size(0)):
+                    teacher_trigger_atar = trig[is_atar]
+                elif int(trig.numel()) == num_atar_hits:
+                    teacher_trigger_atar = trig
+            if isinstance(teacher_node_pdg, torch.Tensor) and int(teacher_node_pdg.dim()) == 2:
+                node = teacher_node_pdg.to(dtype=torch.float32, device=x.device)
+                if int(node.size(0)) == int(x.size(0)):
+                    teacher_node_pdg_atar = node[is_atar]
+                elif int(node.size(0)) == num_atar_hits:
+                    teacher_node_pdg_atar = node
         
         # 1. Encode nodes — subsystem-separated, clean feature sets
         # ATAR: [transverse_coord, z, E, is_yz]
@@ -1000,10 +1033,21 @@ class PurityHybridModel(nn.Module):
                 # Broadcast trigger probs from valid-slice level to hit level
                 trigger_prob_full = torch.zeros(num_global_slices, device=x.device)
                 trigger_prob_full[valid_slice_mask] = atar_trigger_probs
-                hit_trigger_prob = trigger_prob_full[global_slice_idx_all]  # [N_atar]
+                hit_trigger_prob = trigger_prob_full[global_slice_idx_all]  # [N_atar], predicted gate
+                if teacher_trigger_atar is not None and int(teacher_trigger_atar.numel()) == int(hit_trigger_prob.numel()):
+                    hit_trigger_prob = teacher_trigger_atar
 
-                # Pion class prob = column 0 of node PDG sigmoid (DETACHED)
-                pion_class_prob = torch.sigmoid(output['atar_node_pdg'][:, 0]).detach()  # [N_atar]
+                # Pion class prob = column 0 of node PDG sigmoid.
+                # During training, optionally use teacher labels to stabilize
+                # pion-stop pooling while trigger/PDG heads are still maturing.
+                pion_class_prob = torch.sigmoid(output['atar_node_pdg'][:, 0]).detach()  # [N_atar], predicted gate
+                if (
+                    teacher_node_pdg_atar is not None
+                    and int(teacher_node_pdg_atar.dim()) == 2
+                    and int(teacher_node_pdg_atar.size(1)) > 0
+                    and int(teacher_node_pdg_atar.size(0)) == int(pion_class_prob.size(0))
+                ):
+                    pion_class_prob = teacher_node_pdg_atar[:, 0]
 
                 pion_gate = (hit_trigger_prob * pion_class_prob).unsqueeze(-1)  # [N_atar, 1]
 
@@ -1060,8 +1104,17 @@ class PurityHybridModel(nn.Module):
             if 'atar_trigger_logits' in output:
                 trigger_prob_full_t = torch.zeros(num_global_slices, device=x.device)
                 trigger_prob_full_t[valid_slice_mask] = atar_trigger_probs
-                hit_trigger_prob_t = trigger_prob_full_t[global_slice_idx_all]  # [N_atar]
-                mip_class_prob_t = torch.sigmoid(output['atar_node_pdg'][:, 2]).detach()  # [N_atar]
+                hit_trigger_prob_t = trigger_prob_full_t[global_slice_idx_all]  # [N_atar], predicted gate
+                mip_class_prob_t = torch.sigmoid(output['atar_node_pdg'][:, 2]).detach()  # [N_atar], predicted gate
+                if teacher_trigger_atar is not None and int(teacher_trigger_atar.numel()) == int(hit_trigger_prob_t.numel()):
+                    hit_trigger_prob_t = teacher_trigger_atar
+                if (
+                    teacher_node_pdg_atar is not None
+                    and int(teacher_node_pdg_atar.dim()) == 2
+                    and int(teacher_node_pdg_atar.size(1)) > 2
+                    and int(teacher_node_pdg_atar.size(0)) == int(mip_class_prob_t.size(0))
+                ):
+                    mip_class_prob_t = teacher_node_pdg_atar[:, 2]
                 output['atar_hit_trigger_prob'] = hit_trigger_prob_t.detach()
                 output['atar_hit_mip_prob'] = mip_class_prob_t
                 positron_hit_mask = (hit_trigger_prob_t > 0.5) & (mip_class_prob_t > 0.5)
@@ -1080,7 +1133,14 @@ class PurityHybridModel(nn.Module):
 
             if w_positron_angle > 0.0 and 'atar_trigger_logits' in output:
                 # MIP/positron class prob = column 2 of node PDG sigmoid (DETACHED)
-                mip_class_prob = torch.sigmoid(output['atar_node_pdg'][:, 2]).detach()  # [N_atar]
+                mip_class_prob = torch.sigmoid(output['atar_node_pdg'][:, 2]).detach()  # [N_atar], predicted gate
+                if (
+                    teacher_node_pdg_atar is not None
+                    and int(teacher_node_pdg_atar.dim()) == 2
+                    and int(teacher_node_pdg_atar.size(1)) > 2
+                    and int(teacher_node_pdg_atar.size(0)) == int(mip_class_prob.size(0))
+                ):
+                    mip_class_prob = teacher_node_pdg_atar[:, 2]
 
                 # Recompute trigger-prob broadcast from valid-slice logits.
                 # This matches the Phase 10 construction and keeps TorchScript
@@ -1088,6 +1148,8 @@ class PurityHybridModel(nn.Module):
                 trigger_prob_full = torch.zeros(num_global_slices, device=x.device)
                 trigger_prob_full[valid_slice_mask] = atar_trigger_probs
                 hit_trigger_prob = trigger_prob_full[global_slice_idx_all]
+                if teacher_trigger_atar is not None and int(teacher_trigger_atar.numel()) == int(hit_trigger_prob.numel()):
+                    hit_trigger_prob = teacher_trigger_atar
 
                 mip_gate = (hit_trigger_prob * mip_class_prob).unsqueeze(-1)  # [N_atar, 1]
 
