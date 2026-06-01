@@ -10,8 +10,8 @@
           "hidden": 150,
           "heads": 5,
           "layers": 3,
-          "dropout": 0.05,
-          "use_teacher_forcing_gates": true
+          "dropout": 0.1,
+          "use_teacher_forcing_gates": false
         }
       },
       "module": {
@@ -35,7 +35,7 @@
             }
           },
           "lr": 0.0001,
-          "weight_decay": 0.0,
+          "weight_decay": 0.0001,
           "scheduler_step_size": null,
           "scheduler_gamma": 0.5,
           "optimizer_param_groups": [
@@ -43,21 +43,21 @@
               "patterns": [
                 "^model\\.impl\\.(sigma_t_atar_ns|sigma_t_lyso_floor_ns|sigma_t_lyso_scale_ns|angle_sigma_floor|angle_sigma_scale|direction_bias_temperature|temporal_bias_sigma)$"
               ],
-              "lr_scale": 10.0,
+              "lr_scale": 1.0,
               "weight_decay": 0.0
             },
             {
               "patterns": [
-                "^model\\.impl\\.(slim_event_transformer|lyso_event_proj|atar_event_down|event_head|event_head_proj|event_modality_emb|event_slice_emb)(\\.|$)"
+                "^model\\.impl\\.(slim_event_transformer|lyso_event_proj|atar_event_down|atar_event_layers|event_head|event_head_proj|event_modality_emb|event_slice_emb|lyso_encoder|lyso_blocks|lyso_jk|lyso_beta_head|lyso_cluster_coord_head|lyso_fraction_head|atar_role_head)(\\.|$)"
               ],
-              "lr_scale": 5.0
+              "lr_scale": 2.5
             },
             {
               "patterns": [
                 "^model\\."
               ],
               "lr_scale": 1.0,
-              "weight_decay": 1e-08
+              "weight_decay": 0.0001
             }
           ]
         }
@@ -226,8 +226,8 @@
           "hidden": 150,
           "heads": 5,
           "layers": 3,
-          "dropout": 0.05,
-          "use_teacher_forcing_gates": true
+          "dropout": 0.1,
+          "use_teacher_forcing_gates": false
         }
       },
       "module": {
@@ -251,7 +251,7 @@
             }
           },
           "lr": 0.0001,
-          "weight_decay": 0.0,
+          "weight_decay": 0.0001,
           "scheduler_step_size": null,
           "scheduler_gamma": 0.5,
           "optimizer_param_groups": [
@@ -259,21 +259,21 @@
               "patterns": [
                 "^model\\.impl\\.(sigma_t_atar_ns|sigma_t_lyso_floor_ns|sigma_t_lyso_scale_ns|angle_sigma_floor|angle_sigma_scale|direction_bias_temperature|temporal_bias_sigma)$"
               ],
-              "lr_scale": 10.0,
+              "lr_scale": 1.0,
               "weight_decay": 0.0
             },
             {
               "patterns": [
-                "^model\\.impl\\.(slim_event_transformer|lyso_event_proj|atar_event_down|event_head|event_head_proj|event_modality_emb|event_slice_emb)(\\.|$)"
+                "^model\\.impl\\.(slim_event_transformer|lyso_event_proj|atar_event_down|atar_event_layers|event_head|event_head_proj|event_modality_emb|event_slice_emb|lyso_encoder|lyso_blocks|lyso_jk|lyso_beta_head|lyso_cluster_coord_head|lyso_fraction_head|atar_role_head)(\\.|$)"
               ],
-              "lr_scale": 5.0
+              "lr_scale": 2.5
             },
             {
               "patterns": [
                 "^model\\."
               ],
               "lr_scale": 1.0,
-              "weight_decay": 1e-08
+              "weight_decay": 0.0001
             }
           ]
         }
@@ -314,59 +314,7 @@
         "restore_param_trainability_after_training": true,
         "phases": [
           {
-            "name": "atar_bootstrap",
-            "max_epochs": 8,
-            "task_weights": {
-              "w_atar_slice_multi": 0.2,
-              "w_node_pdg": 1.5,
-              "w_atar_edge": 0.0,
-              "w_node_trigger": 0.0,
-              "w_slice_pdg": 1.0,
-              "w_atar_trigger_slice": 0.0,
-              "w_pion_kinematics": 0.0,
-              "w_endpoints": 0.025,
-              "w_positron_angle": 0.0,
-              "w_lyso_condensation": 0.25,
-              "w_positron_energy": 0.0,
-              "w_event_builder": 0.0
-            },
-            "freeze_all": false,
-            "trainable_param_patterns": [],
-            "freeze_param_patterns": [],
-            "unfreeze_param_patterns": [],
-            "optimizer_overrides": {
-              "lr": 0.0001,
-              "weight_decay": 0.0
-            }
-          },
-          {
-            "name": "atar_trigger_slice",
-            "max_epochs": 4,
-            "task_weights": {
-              "w_atar_slice_multi": 0.2,
-              "w_node_pdg": 1.5,
-              "w_atar_edge": 0.0,
-              "w_node_trigger": 0.0,
-              "w_slice_pdg": 1.0,
-              "w_atar_trigger_slice": 0.5,
-              "w_pion_kinematics": 0.0,
-              "w_endpoints": 0.025,
-              "w_positron_angle": 0.0,
-              "w_lyso_condensation": 0.25,
-              "w_positron_energy": 0.0,
-              "w_event_builder": 0.0
-            },
-            "freeze_all": false,
-            "trainable_param_patterns": [],
-            "freeze_param_patterns": [],
-            "unfreeze_param_patterns": [],
-            "optimizer_overrides": {
-              "lr": 1e-05,
-              "weight_decay": 0.0
-            }
-          },
-          {
-            "name": "downstream_kinematics",
+            "name": "pre_event",
             "max_epochs": 4,
             "task_weights": {
               "w_atar_slice_multi": 0.2,
@@ -387,13 +335,13 @@
             "freeze_param_patterns": [],
             "unfreeze_param_patterns": [],
             "optimizer_overrides": {
-              "lr": 1e-05,
-              "weight_decay": 0.0
+              "lr": 0.0002,
+              "weight_decay": 0.0001
             }
           },
           {
             "name": "event_fusion",
-            "max_epochs": 4,
+            "max_epochs": 2,
             "task_weights": {
               "w_atar_slice_multi": 0.2,
               "w_node_pdg": 1.5,
@@ -406,15 +354,15 @@
               "w_positron_angle": 1.0,
               "w_lyso_condensation": 0.25,
               "w_positron_energy": 0.0,
-              "w_event_builder": 0.1
+              "w_event_builder": 0.2
             },
             "freeze_all": false,
             "trainable_param_patterns": [],
             "freeze_param_patterns": [],
             "unfreeze_param_patterns": [],
             "optimizer_overrides": {
-              "lr": 1e-05,
-              "weight_decay": 0.0
+              "lr": 0.0002,
+              "weight_decay": 0.0001
             }
           }
         ]
