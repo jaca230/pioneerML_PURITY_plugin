@@ -24,6 +24,9 @@ class MultiLevelGraphLoader(GraphLoader):
                 "atar_slice_pdg_target",
                 "atar_slice_multi_target",
                 "atar_slice_trigger_target",
+                "atar_slice_role_target",
+                "atar_triggering_pion_slice",
+                "dead_E_target",
                 "atar_slice_start_target",
                 "atar_slice_stop_target",
                 "atar_angle_target",
@@ -54,6 +57,9 @@ class MultiLevelGraphLoader(GraphLoader):
         data.atar_slice_pdg_target = torch.empty((0, 3), dtype=torch.float32)
         data.atar_slice_multi_target = torch.empty((0,), dtype=torch.float32)
         data.atar_slice_trigger_target = torch.empty((0,), dtype=torch.float32)
+        data.atar_slice_role_target = torch.empty((0,), dtype=torch.int64)
+        data.atar_triggering_pion_slice = torch.empty((0,), dtype=torch.int64)
+        data.dead_E_target = torch.empty((0,), dtype=torch.float32)
         data.atar_slice_start_target = torch.empty((0, 3), dtype=torch.float32)
         data.atar_slice_stop_target = torch.empty((0, 3), dtype=torch.float32)
         data.atar_angle_target = torch.empty((0, 3), dtype=torch.float32)
@@ -158,6 +164,16 @@ class MultiLevelGraphLoader(GraphLoader):
         else:
             d.has_trigger_positron = torch.zeros((num_graphs,), dtype=torch.float32)
 
+        if "atar_triggering_pion_slice" in chunk and chunk["atar_triggering_pion_slice"] is not None:
+            d.atar_triggering_pion_slice = chunk["atar_triggering_pion_slice"][g0:g1].to(dtype=torch.int64)
+        else:
+            d.atar_triggering_pion_slice = torch.full((g1 - g0,), -1, dtype=torch.int64)
+
+        if "dead_E_target" in chunk and chunk["dead_E_target"] is not None:
+            d.dead_E_target = chunk["dead_E_target"][g0:g1]
+        else:
+            d.dead_E_target = torch.zeros((g1 - g0,), dtype=torch.float32)
+
         atar_slice_ptr = chunk.get("atar_slice_ptr")
         if atar_slice_ptr is not None:
             a0 = int(atar_slice_ptr[g0].item())
@@ -180,6 +196,10 @@ class MultiLevelGraphLoader(GraphLoader):
             d.atar_slice_trigger_target = chunk["atar_slice_trigger_target"][a0:a1]
         else:
             d.atar_slice_trigger_target = torch.empty((0,), dtype=torch.float32)
+        if "atar_slice_role_target" in chunk and chunk["atar_slice_role_target"] is not None and a1 > a0:
+            d.atar_slice_role_target = chunk["atar_slice_role_target"][a0:a1].to(dtype=torch.int64)
+        else:
+            d.atar_slice_role_target = torch.empty((0,), dtype=torch.int64)
         if "atar_slice_start_target" in chunk and chunk["atar_slice_start_target"] is not None and a1 > a0:
             d.atar_slice_start_target = chunk["atar_slice_start_target"][a0:a1]
         else:

@@ -289,6 +289,40 @@ class PurityGraphLoader(MultiLevelGraphLoader):
                     required=False,
                     target_only=True,
                 ),
+                # These three were consumed by build_purity_graph_stage but never
+                # registered here, so they arrived empty -> the LYSO trigger target fell
+                # back to (origin==0 & EM), and with lyso_pdg also empty the EM mask was
+                # all-False -> the entire LYSO is_trigger_target was silently zero (the
+                # trigger gate had no positives to learn from). lyso_truth_t was likewise
+                # zero. The atar_* equivalents above were registered; the lyso_* were not.
+                NDArrayColumnSpec(
+                    column="lyso_pdg",
+                    field="lyso_pdg",
+                    dtype=np.int64,
+                    required=False,
+                    target_only=True,
+                ),
+                NDArrayColumnSpec(
+                    column="lyso_truth_t",
+                    field="lyso_truth_t",
+                    dtype=np.float32,
+                    required=False,
+                    target_only=True,
+                ),
+                NDArrayColumnSpec(
+                    column="lyso_is_trigger",
+                    field="lyso_is_trigger",
+                    dtype=np.int64,
+                    required=False,
+                    target_only=True,
+                ),
+                NDArrayColumnSpec(
+                    column="dead_E",
+                    field="dead_E",
+                    dtype=np.float32,
+                    required=False,
+                    target_only=True,
+                ),
             )
         )
         return LoaderSchema(features=features, targets=targets)
@@ -365,6 +399,9 @@ class PurityGraphLoader(MultiLevelGraphLoader):
                     "atar_slice_pdg_target": "atar_slice_pdg_target_out",
                     "atar_slice_multi_target": "atar_slice_multi_target_out",
                     "atar_slice_trigger_target": "atar_slice_trigger_target_out",
+                    "atar_slice_role_target": "atar_slice_role_target_out",
+                    "atar_triggering_pion_slice": "atar_triggering_pion_slice_out",
+                    "dead_E_target": "dead_E_target_out",
                     "atar_slice_start_target": "atar_slice_start_target_out",
                     "atar_slice_stop_target": "atar_slice_stop_target_out",
                     "atar_angle_target": "atar_angle_target_out",
