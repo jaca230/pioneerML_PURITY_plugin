@@ -180,8 +180,7 @@ class PurityModel(BaseGraphClassifierModel):
     """
     Adapter wrapper for the core `PurityHybridModel`.
 
-    The internal implementation mirrors:
-    `deprecated/omar_pioneerML/unified_reco/models.py`
+    The internal implementation mirrors the original `unified_reco/models.py`.
     """
 
     def __init__(
