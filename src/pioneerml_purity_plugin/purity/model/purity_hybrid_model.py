@@ -752,7 +752,7 @@ class PurityHybridModel(nn.Module):
             h_atar_dense, atar_mask = to_dense_batch(h_atar, batch_atar, batch_size=batch_size)
             h_calo_dense, calo_mask = to_dense_batch(h_calo, batch_calo, batch_size=batch_size)
 
-            # Time-Proximity Masking
+            # Time-Proximity Masking.
             if x.shape[1] > 9:
                 atar_mean_t = x[is_atar, 9]
                 lyso_mean_t = x[is_lyso, 9]
@@ -760,14 +760,22 @@ class PurityHybridModel(nn.Module):
                 lyso_t_dense, _ = to_dense_batch(lyso_mean_t, batch_calo, batch_size=batch_size)
 
                 time_diff = torch.abs(atar_t_dense.unsqueeze(2) - lyso_t_dense.unsqueeze(1))
-                time_block = (time_diff > 5.0)
-                combined_block = time_block | (~calo_mask.unsqueeze(1))
-                all_keys_blocked = combined_block.all(dim=2)
-
-                safe_time_block = time_block & (~all_keys_blocked.unsqueeze(2))
+                # Block keys that are time-separated (>5 ns) OR padding.
+                block = (time_diff > 5.0) | (~calo_mask.unsqueeze(1))   # [B, L_atar, S_lyso]
+                all_keys_blocked = block.all(dim=2)                     # queries with no attendable key
+                # NaN GUARD: use a large FINITE floor (not -inf) and fold key-padding into this one
+                # additive mask (so key_padding_mask=None). For a partially-blocked row the blocked
+                # keys still get ~0 weight (exp(floor)->0), identical to -inf. For a FULLY-blocked row
+                # the constant floor cancels inside the softmax -> a finite, valid distribution whose
+                # output is discarded below, instead of softmax(all -inf) = NaN. An -inf fully-blocked
+                # row gives a finite forward (output zeroed) but a NaN BACKWARD (the degenerate softmax
+                # poisons grad_weight via NaN*0). Time-spread Lu-176 radioactivity routinely produces
+                # ATAR queries with no time-coincident (or zero) LYSO keys, so this fired ~1/200 batches.
+                # The floor is dtype-aware (finfo.min/2) so it stays finite under fp16/bf16 autocast too.
+                neg_floor = torch.finfo(h_atar_dense.dtype).min / 2
+                attn_mask = torch.where(block, torch.full_like(time_diff, neg_floor),
+                                        torch.zeros_like(time_diff)).to(h_atar_dense.dtype)
                 num_heads = self.cross_attention.num_heads
-                attn_mask = torch.zeros_like(safe_time_block, dtype=h_atar_dense.dtype)
-                attn_mask[safe_time_block] = float('-inf')
                 attn_mask = attn_mask.repeat_interleave(num_heads, dim=0)
             else:
                 attn_mask = None
@@ -777,12 +785,12 @@ class PurityHybridModel(nn.Module):
                 query=h_atar_dense,
                 key=h_calo_dense.detach(),
                 value=h_calo_dense.detach(),
-                key_padding_mask=~calo_mask,
-                attn_mask=attn_mask
+                attn_mask=attn_mask,   # key-padding folded in with a finite floor (no -inf, no NaN)
             )
 
             if all_keys_blocked is not None:
-                h_atar_enriched[all_keys_blocked] = 0.0
+                # Discard enrichment for queries that had no attendable key.
+                h_atar_enriched = h_atar_enriched.masked_fill(all_keys_blocked.unsqueeze(-1), 0.0)
 
             h_atar_dense = h_atar_dense + h_atar_enriched
             h_atar = h_atar_dense[atar_mask]
@@ -1403,13 +1411,23 @@ class PurityHybridModel(nn.Module):
 
             ps_lyso = pion_stop_pred.detach().unsqueeze(1) * 0.1
             hit_delta = g_phys_pos - ps_lyso
-            hit_r = hit_delta.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            # Backward-safe norm (defensive / cross-version-safe): sqrt(sum(v^2)+eps^2) is
+            # forward-identical to .norm().clamp(min=eps) for v!=0 and has a finite gradient (0)
+            # at v=0. On some torch versions .norm() backward at a zero vector is 0/0=NaN; the
+            # installed linalg backend guards it, so this is hardening for degenerate LYSO
+            # clusters (single-hit / coincident-position) rather than the confirmed live fix.
+            hit_r = torch.sqrt((hit_delta * hit_delta).sum(dim=-1, keepdim=True) + 1e-12)
             hit_dir = hit_delta / hit_r
             hit_dir = hit_dir * mask.unsqueeze(-1).float()
             cluster_dir_raw = torch.bmm(
                 w_norm.transpose(1, 2), hit_dir
             ) / w_sum_safe.unsqueeze(-1)
-            cluster_dir_norm = cluster_dir_raw.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            # Backward-safe norm (see hit_r above): cluster_dir_raw flows from the grad-carrying
+            # soft assignment w_norm, so an empty/degenerate cluster (zero direction vector) is the
+            # kind of input that can backprop 0/0=NaN through .norm() on some torch versions.
+            # Defensive hardening — the confirmed live NaN source on this data was the ATAR<->LYSO
+            # cross-attention fully-masked row (see the finite-floor mask above), not this norm.
+            cluster_dir_norm = torch.sqrt((cluster_dir_raw * cluster_dir_raw).sum(dim=-1, keepdim=True) + 1e-12)
             cluster_dir = cluster_dir_raw / cluster_dir_norm
             cluster_dir = cluster_dir.masked_fill(seed_invalid.unsqueeze(-1), 0.0)
 
