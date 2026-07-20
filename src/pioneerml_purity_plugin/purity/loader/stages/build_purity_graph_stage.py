@@ -26,6 +26,7 @@ class BuildPurityGraphStage(BaseStage):
         "edge_index_out",
         "edge_attr_out",
         "graph_event_id",
+        "graph_event_id_is_global",
         "graph_time_group_id",
         "node_slice_id_out",
         "slice_graph_id_out",
@@ -389,6 +390,7 @@ class BuildPurityGraphStage(BaseStage):
             state["edge_attr_out"] = np.zeros((0, self.edge_feature_dim), dtype=np.float32)
             state["edge_index_out"] = np.zeros((2, 0), dtype=np.int64)
             state["graph_event_id"] = np.zeros((0,), dtype=np.int64)
+            state["graph_event_id_is_global"] = False
             state["graph_time_group_id"] = np.zeros((0,), dtype=np.int64)
             state["node_slice_id_out"] = np.zeros((0,), dtype=np.int64)
             state["slice_graph_id_out"] = np.zeros((0,), dtype=np.int64)
@@ -980,6 +982,7 @@ class BuildPurityGraphStage(BaseStage):
         state["edge_attr_out"] = edge_attr_out
         state["edge_index_out"] = edge_index_out
         state["graph_event_id"] = np.asarray(graph_event_ids, dtype=np.int64)
+        state["graph_event_id_is_global"] = event_id_values is not None
         state["graph_time_group_id"] = np.zeros((total_graphs,), dtype=np.int64)
         state["node_slice_id_out"] = node_slice_id_out
         state["slice_graph_id_out"] = slice_graph_id_out

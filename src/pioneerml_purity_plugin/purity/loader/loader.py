@@ -355,6 +355,9 @@ class PurityGraphLoader(MultiLevelGraphLoader):
                 },
                 scalar_state_fields={"num_rows": "n_rows"},
                 scalar_layout_fields={"num_graphs": "total_graphs"},
+                optional_scalar_state_fields={
+                    "graph_event_id_is_global": "graph_event_id_is_global",
+                },
                 optional_tensor_state_fields={
                     "y_graph": "y_graph_out",
                     "y_event": "y_event_out",
