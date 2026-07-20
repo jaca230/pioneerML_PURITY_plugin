@@ -32,16 +32,30 @@ class PurityDataWriter(TimeGroupGraphDataWriter):
     """Writer for PURITY event-level signal predictions."""
 
     def output_schema(self) -> OutputSchema:
+        def output_column(output_column: str, **kwargs) -> OutputColumnSpec:
+            metadata = dict(kwargs.pop("metadata", {}))
+            metadata["pioneer.tes_path"] = f"/Event/ML/Purity/{output_column}"
+            return OutputColumnSpec(output_column, metadata=metadata, **kwargs)
+
         return OutputSchema(
             fields=(
-                OutputColumnSpec(
+                output_column(
+                    "event_id",
+                    value_type=pa.int64(),
+                    metadata={"pioneer.role": "alignment"},
+                ),
+                output_column(
+                    "time_group_ids",
+                    value_type=pa.int64(),
+                ),
+                output_column(
                     "pred_purity_signal",
                     model_output_name="main",
                     output_index=0,
                     dtype=np.float32,
                     value_type=pa.float32(),
                 ),
-                OutputColumnSpec(
+                output_column(
                     "pred_purity_logit",
                     model_output_name="logit",
                     output_index=0,
@@ -49,42 +63,42 @@ class PurityDataWriter(TimeGroupGraphDataWriter):
                     value_type=pa.float32(),
                     required=False,
                 ),
-                OutputColumnSpec(
+                output_column(
                     "pred_purity_summary_accepted",
                     model_output_name="summary_accepted",
                     dtype=np.float32,
                     value_type=pa.float32(),
                     required=False,
                 ),
-                OutputColumnSpec(
+                output_column(
                     "pred_purity_summary_positron_energy",
                     model_output_name="summary_positron_energy",
                     dtype=np.float32,
                     value_type=pa.float32(),
                     required=False,
                 ),
-                OutputColumnSpec(
+                output_column(
                     "pred_purity_summary_positron_time",
                     model_output_name="summary_positron_time",
                     dtype=np.float32,
                     value_type=pa.float32(),
                     required=False,
                 ),
-                OutputColumnSpec(
+                output_column(
                     "pred_purity_summary_positron_polar_angle",
                     model_output_name="summary_positron_polar_angle",
                     dtype=np.float32,
                     value_type=pa.float32(),
                     required=False,
                 ),
-                OutputColumnSpec(
+                output_column(
                     "pred_purity_guard_valid",
                     model_output_name="guard_valid",
                     dtype=np.float32,
                     value_type=pa.float32(),
                     required=False,
                 ),
-                OutputColumnSpec(
+                output_column(
                     "pred_purity_guard_reason",
                     model_output_name="guard_reason",
                     dtype=np.int32,
