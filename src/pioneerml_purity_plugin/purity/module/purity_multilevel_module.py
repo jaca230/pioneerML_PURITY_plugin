@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import re
 from collections.abc import Mapping
 from typing import Any, Dict
@@ -26,10 +27,20 @@ class PurityMultiLevelLightningModule(GraphLightningModule):
         optimizer_param_groups: list[dict[str, Any]] | None = None,
         **kwargs,
     ):
-        # Omar parity: default optimizer is Adam (not AdamW).
+        # Keep Dropout layers stochastic during validation (MC-dropout). Graph nets
+        # are trained with dropout on, so evaluating with it off measures a different,
+        # lower-variance network than the one being optimized; keeping it on makes the
+        # val loss share the train dropout regime. Scoped to the Lightning val metric
+        # only — the evaluator/export call model.eval() directly and stay deterministic.
+        # Default on; set mc_dropout_in_val=False to restore eval-mode validation.
+        mc_dropout_in_val = kwargs.pop("mc_dropout_in_val", True)
+        # V2 parity: both reference trainers (train_purity.py / train_fast3_staged.py)
+        # build the optimizer with torch.optim.AdamW (decoupled weight decay). The earlier
+        # "Omar parity: Adam" override was incorrect — neither reference uses Adam.
         if optimizer_cls is None:
-            optimizer_cls = optim.Adam
+            optimizer_cls = optim.AdamW
         super().__init__(*args, optimizer_cls=optimizer_cls, **kwargs)
+        self._mc_dropout_in_val = bool(mc_dropout_in_val)
         self._last_token_batch: torch.Tensor | None = None
         self._last_token_valid: torch.Tensor | None = None
         self._task_weights: dict[str, float] | None = None
@@ -56,6 +67,45 @@ class PurityMultiLevelLightningModule(GraphLightningModule):
         loss_setter = getattr(self.loss_fn, "set_task_weights", None)
         if callable(loss_setter):
             loss_setter(self._task_weights)
+
+    def _enable_val_dropout(self) -> None:
+        """Keep EVERY dropout source stochastic during validation (MC-dropout) after
+        Lightning has put the model in eval mode. We deliberately do NOT flip the
+        module's global `self.training` flag: that also gates teacher forcing and the
+        inference path in the model adapter, so flipping it would make validation
+        artificially easy. Instead we set train mode on exactly the dropout-bearing
+        modules, whose ONLY train/eval-dependent behaviour is dropout.
+
+        A full layer census of the model confirms three dropout sources (and no
+        BatchNorm, so nothing else is affected):
+          * nn.Dropout (FFN / head / transformer-layer dropout)        -> _DropoutNd
+          * nn.MultiheadAttention (cross-attn + transformer self-attn) -> functional
+          * torch_geometric TransformerConv (GNN attention dropout)    -> functional
+        If a new dropout-bearing layer type is ever added, extend this set.
+        """
+        from torch.nn.modules.dropout import _DropoutNd
+
+        try:
+            from torch_geometric.nn import TransformerConv
+        except Exception:  # pragma: no cover - torch_geometric is always present here
+            TransformerConv = ()
+
+        dropout_types: tuple[type, ...] = (_DropoutNd, torch.nn.MultiheadAttention)
+        if TransformerConv:
+            dropout_types = dropout_types + (TransformerConv,)
+
+        n_active = 0
+        for module in self.model.modules():
+            if isinstance(module, dropout_types):
+                module.train(True)
+                n_active += 1
+        if not getattr(self, "_logged_val_dropout", False):
+            self._logged_val_dropout = True
+            print(
+                f"[purity] MC-dropout in validation: {n_active} dropout-bearing modules "
+                "kept active (teacher forcing stays off)",
+                flush=True,
+            )
 
     def _model_forward(self, batch: Batch) -> Any:
         model = self.model
@@ -124,6 +174,8 @@ class PurityMultiLevelLightningModule(GraphLightningModule):
         return loss
 
     def validation_step(self, batch: Batch, batch_idx: int) -> None:
+        if getattr(self, "_mc_dropout_in_val", True):
+            self._enable_val_dropout()
         raw_preds = self._model_forward(batch)
         loss, terms = self.compute_loss(raw_preds, batch)
         bs = self._get_batch_size(batch)
@@ -230,7 +282,17 @@ class PurityMultiLevelLightningModule(GraphLightningModule):
         return super().primary_target(batch, preds)
 
     def on_before_optimizer_step(self, optimizer: optim.Optimizer) -> None:
-        """Fail fast on non-finite gradients before parameters are updated."""
+        """Fail fast on non-finite gradients before parameters are updated.
+
+        Default behaviour raises (strict diagnostic). Set
+        PURITY_SKIP_NONFINITE_GRAD=1 to instead skip the offending step by
+        zeroing all grads (so the optimizer update is a no-op) and continue —
+        AMP/GradScaler-style robustness for the rare non-finite step that can
+        occur on noisy/busy data (e.g. realistic radioactivity background). The
+        bad grad is caught BEFORE the weight update, so parameters stay finite
+        and the next batch proceeds. Skips are counted and logged.
+        """
+        skip = os.environ.get("PURITY_SKIP_NONFINITE_GRAD", "") not in ("", "0", "false", "False")
         for name, param in self.named_parameters():
             grad = param.grad
             if grad is None:
@@ -243,12 +305,26 @@ class PurityMultiLevelLightningModule(GraphLightningModule):
                 inf_count = int(torch.isinf(flat).sum().item())
                 min_v = float(flat[finite].min().item()) if finite_count > 0 else float("nan")
                 max_v = float(flat[finite].max().item()) if finite_count > 0 else float("nan")
-                raise RuntimeError(
-                    "[purity_module] non-finite gradient detected before optimizer step "
+                detail = (
                     f"for parameter={name}\n"
                     f"shape={tuple(grad.shape)} numel={int(flat.numel())} "
                     f"finite={finite_count} nan={nan_count} inf={inf_count} "
                     f"min={min_v:.6g} max={max_v:.6g}"
+                )
+                if skip:
+                    self._nonfinite_skips = getattr(self, "_nonfinite_skips", 0) + 1
+                    for p in self.parameters():
+                        if p.grad is not None:
+                            p.grad.zero_()
+                    print(
+                        f"[purity_module] WARNING non-finite gradient -> skipping step "
+                        f"(total skipped={self._nonfinite_skips}); first bad {detail}",
+                        flush=True,
+                    )
+                    return super().on_before_optimizer_step(optimizer)
+                raise RuntimeError(
+                    "[purity_module] non-finite gradient detected before optimizer step "
+                    + detail
                 )
         return super().on_before_optimizer_step(optimizer)
 

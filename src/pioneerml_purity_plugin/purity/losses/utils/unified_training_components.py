@@ -1,5 +1,7 @@
 """Core unified PURITY loss internals ported from unified_reco/train_utils.py."""
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,11 +11,20 @@ class PinballLoss(nn.Module):
     Robust Permutation-Invariant Endpoint Loss using Asymmetric Attenuated Pinball Loss.
     Adapted from endpoint_finder.ipynb for the PURITY architecture.
     """
-    def __init__(self, quantiles=[0.16, 0.50, 0.84], loss_scale_span=0.1, loss_scale_dir=0.1):
+    def __init__(self, quantiles=[0.16, 0.50, 0.84], loss_scale_span=0.1, loss_scale_dir=0.1,
+                 sigma_floor=1e-3):
         super().__init__()
         self.quantiles = quantiles
         self.loss_scale_span = loss_scale_span
         self.loss_scale_dir = loss_scale_dir
+        # Numerical guardrail on the predicted quantile scale -- NOT an uncertainty
+        # target. Without it the attenuated term (2*err/sigma + log sigma) rewards
+        # sigma -> 0 and its gradient explodes like 1/sigma^2, NaN-ing the shared
+        # trunk over many steps. Keep this 10-100x BELOW the healthy MeanWidth so it
+        # only bites during collapse and never inflates normal uncertainty estimates.
+        # Restored from V2 frozen reference (train_utils.py) after diff showed the
+        # plugin had dropped it.
+        self.sigma_floor = sigma_floor
     def forward(self, preds, targets, weights=None, error_scale=1.0):
         if preds.dim() != 4 or targets.dim() != 3:
             raise ValueError("Expected preds shape [N, 2, 3, 3] and targets shape [N, 2, 3]")
@@ -39,6 +50,7 @@ class PinballLoss(nn.Module):
         sigma_total = sigma_left + sigma_right
         
         scales = torch.stack([sigma_left, sigma_total, sigma_right], dim=-1)
+        scales = scales.clamp(min=self.sigma_floor)   # block variance collapse / 1/sigma^2 blow-up
         log_scales = torch.log(scales)
         
         pos_loss = 0.0
@@ -152,8 +164,15 @@ class CondensationLoss(nn.Module):
                 is_redundant_signal = (~is_background) & (~is_seed)
                 
                 if is_redundant_signal.any():
-                    # Highlander Penalty: Force 'Loser' signal hits to beta -> 0
-                    loss_beta += self.w_highlander * e_beta[is_redundant_signal].mean()
+                    # Highlander Penalty: Force 'Loser' signal hits to beta -> 0.
+                    # BCE preserves gradient at saturation (vs L1 mean which dies
+                    # as β→1), so non-alpha hits stuck near 1 actually feel pull
+                    # back — restored from V2 frozen reference (train_utils.py)
+                    # after diff showed plugin had reverted to L1 mean.
+                    redundant_betas = e_beta[is_redundant_signal].nan_to_num(0.5).clamp(1e-6, 1 - 1e-6)
+                    loss_beta += self.w_highlander * F.binary_cross_entropy(
+                        redundant_betas, torch.zeros_like(redundant_betas)
+                    )
 
                 # --- B. Signal Alpha Loss (Seeds must be 1.0) ---
                 valid_alpha_betas = e_beta[alpha_indices][valid_obj_mask].nan_to_num(0.5).clamp(1e-6, 1-1e-6)
@@ -596,14 +615,80 @@ class PURITYLoss(nn.Module):
                 loss_dict['loss_slice_pdg'] = l_slice
                 total_loss += w_slice * l_slice
             
-        # 3. ATAR Trigger Slice Loss (Phase 9)
+        # 3. ATAR Trigger Slice Loss (Phase 9) — V2 role-based attachment.
+        # 3-class CE over {0: none/pion-anchor, 1: muon, 2: mip/e+} on NON-anchor slices
+        # (the anchor pion is supplied via teacher forcing, so it is excluded), plus a
+        # per-event composition penalty discouraging >1 muon / >1 positron per chain.
         w_trigger_slice = self.config.get('w_atar_trigger_slice', 0.0)
-        if w_trigger_slice > 0.0 and 'atar_trigger_logits' in outputs and 'tar_slice_trigger' in targets:
-            if _has_elements(outputs['atar_trigger_logits'], targets['tar_slice_trigger']):
-                l_trigger_slice = self.bce_logits(outputs['atar_trigger_logits'], targets['tar_slice_trigger'])
+        if w_trigger_slice > 0.0 and 'atar_role_logits' in outputs and 'tar_slice_role' in targets:
+            role_logits = outputs['atar_role_logits']
+            role_targets = targets['tar_slice_role'].long()
+            if int(role_logits.size(0)) > 0 and int(role_targets.numel()) == int(role_logits.size(0)):
+                is_anchor = outputs.get('atar_anchor_slice_mask')
+                if not isinstance(is_anchor, torch.Tensor):
+                    is_anchor = torch.zeros(role_logits.size(0), dtype=torch.bool, device=role_logits.device)
+                non_anchor = ~is_anchor
+                if bool(non_anchor.any().item()):
+                    l_role_ce = F.cross_entropy(role_logits[non_anchor], role_targets[non_anchor])
+                else:
+                    l_role_ce = role_logits.new_zeros(())
+                slice_event_idx = outputs.get('atar_slice_event_idx')
+                if isinstance(slice_event_idx, torch.Tensor) and int(slice_event_idx.numel()) > 0:
+                    role_probs = F.softmax(role_logits, dim=-1)
+                    num_events = int(slice_event_idx.max().item()) + 1
+                    mu_sum = role_logits.new_zeros(num_events)
+                    e_sum = role_logits.new_zeros(num_events)
+                    mu_sum.index_add_(0, slice_event_idx.long(), role_probs[:, 1])
+                    e_sum.index_add_(0, slice_event_idx.long(), role_probs[:, 2])
+                    l_composition = F.relu(mu_sum - 1.0).pow(2).mean() + F.relu(e_sum - 1.0).pow(2).mean()
+                else:
+                    l_composition = role_logits.new_zeros(())
+                lambda_comp = float(self.config.get('lambda_composition', 0.2))
+                l_trigger_slice = l_role_ce + lambda_comp * l_composition
+                loss_dict['loss_role_ce'] = l_role_ce
+                loss_dict['loss_composition'] = l_composition
                 loss_dict['loss_trigger_slice'] = l_trigger_slice
                 total_loss += w_trigger_slice * l_trigger_slice
         
+        # 3.5 Trigger-positron time-spread loss (V2): the trigger positron is one track
+        # in one slice (~1 ns spread); if the model tags hits across slices as the
+        # positron, the trigger-/MIP-weighted std over time blows up -> penalize.
+        w_spread = self.config.get('w_time_spread', 0.0)
+        if (w_spread > 0.0 and batch is not None
+                and 'atar_node_pdg' in outputs
+                and 'atar_hit_trigger_prob' in outputs):
+            x_ts = batch.x
+            is_atar_ts = (x_ts[:, 5] > 0.5) | (x_ts[:, 6] > 0.5)
+            if bool(is_atar_ts.any().item()):
+                t_atar = x_ts[is_atar_ts, 4] * 500.0  # ns (NORM_T_ATAR=500)
+                b_atar = batch.batch[is_atar_ts]
+                B_total = int(batch.batch.max().item()) + 1
+                pos_p = torch.sigmoid(outputs['atar_node_pdg'][:, 2])
+                hit_trig = outputs['atar_hit_trigger_prob']
+                trig_floor = float(self.config.get('time_spread_trig_floor', 0.25))
+                mip_floor = float(self.config.get('time_spread_mip_floor', 0.25))
+                hit_trig_eff = hit_trig * (hit_trig > trig_floor).float()
+                pos_p_eff = pos_p * (pos_p > mip_floor).float()
+                sum_trig = torch.zeros(B_total, device=x_ts.device)
+                count_atar = torch.zeros(B_total, device=x_ts.device)
+                sum_trig.index_add_(0, b_atar, hit_trig_eff)
+                count_atar.index_add_(0, b_atar, torch.ones_like(hit_trig))
+                avg_trig_per_event = sum_trig / count_atar.clamp(min=1.0)
+                threshold_ns = float(self.config.get('time_spread_thresh_ns', 1.0))
+                w_ts = pos_p_eff * hit_trig_eff
+                sum_w = torch.zeros(B_total, device=x_ts.device)
+                sum_wt = torch.zeros(B_total, device=x_ts.device)
+                sum_w.index_add_(0, b_atar, w_ts)
+                sum_wt.index_add_(0, b_atar, w_ts * t_atar)
+                sum_w_safe = sum_w.clamp(min=1e-3)
+                mean_t_per_hit = (sum_wt / sum_w_safe)[b_atar]
+                sum_w_diff = torch.zeros(B_total, device=x_ts.device)
+                sum_w_diff.index_add_(0, b_atar, w_ts * (t_atar - mean_t_per_hit) ** 2)
+                std_t = torch.sqrt((sum_w_diff / sum_w_safe).clamp(min=0.0) + 1e-6)
+                l_time_spread = torch.log1p(F.relu(std_t - threshold_ns) * avg_trig_per_event).mean()
+                loss_dict['loss_time_spread'] = l_time_spread
+                total_loss += w_spread * l_time_spread
+
         # 3A. Kinematic Pion Stop (Phase 10 — per-graph regression)
         w_pion = self.config.get('w_pion_kinematics', 0.0)
         if w_pion > 0.0 and 'atar_pion_stop' in outputs and 'tar_pion_stop_xyz' in targets:
@@ -717,6 +802,25 @@ class PURITYLoss(nn.Module):
             # Add to the global backpropagation total
             total_loss += w_lyso * l_cond
         
+        # --- Dead-material energy regression (V2, post-hoc detached head) ---
+        w_dead = self.config.get('w_dead_energy', 0.0)
+        if w_dead > 0.0 and 'dead_energy_log_pred' in outputs and 'tar_dead_E' in targets:
+            log_pred = outputs['dead_energy_log_pred']
+            log_true = torch.log1p(targets['tar_dead_E'].clamp(min=0.0))
+            log6 = math.log(6.0)
+            sq = (log_pred - log_true).clamp(min=-log6, max=log6).pow(2)
+            mask = torch.ones_like(sq)
+            es = outputs.get('event_summary', {})
+            polar = es.get('positron_polar_angle') if isinstance(es, dict) else None
+            if isinstance(polar, torch.Tensor) and polar.numel() == sq.numel():
+                mask = mask * (polar < math.radians(130.0)).float()
+            htp_rule = outputs.get('has_trigger_positron_rule')
+            if isinstance(htp_rule, torch.Tensor) and htp_rule.numel() == sq.numel():
+                mask = mask * (htp_rule > 0.5).float()
+            l_dead = (sq * mask).sum() / mask.sum().clamp(min=1.0)
+            loss_dict['loss_dead_energy'] = l_dead
+            total_loss += w_dead * l_dead
+
         # --- Event Synthesis Loss ---
         w_event = self.config.get('w_event_builder', 0.0)
         if w_event > 0.0 and 'unified_event_logits' in outputs and batch is not None:
@@ -755,6 +859,32 @@ def format_targets_from_batch(batch):
     # Per-slice trigger flag (Phase 9 target)
     if hasattr(batch, 'atar_slice_trigger_target') and batch.atar_slice_trigger_target is not None:
         targets['tar_slice_trigger'] = batch.atar_slice_trigger_target.float()
+    # Per-slice role in the triggering chain {0: none/pion-anchor, 1: muon, 2: mip/e+}.
+    # NOTE: we DERIVE this from the slice-pdg + slice-trigger targets rather than reading
+    # batch.atar_slice_role_target directly. The framework's intra-chunk graph shuffle
+    # (structured_loader._shuffle_chunk_graphs) only re-permutes a hard-coded set of
+    # ATAR-slice targets (atar_slice_pdg/trigger/start/stop/...) and does NOT include the
+    # plugin-added atar_slice_role_target, so that raw field is misaligned per-graph after
+    # shuffling. The slice-pdg and slice-trigger targets ARE permuted, so deriving role
+    # from them is shuffle-safe and stays aligned with the model's slice ordering. The
+    # derivation exactly mirrors the loader's role logic (pion>muon>mip priority).
+    if (hasattr(batch, 'atar_slice_pdg_target') and batch.atar_slice_pdg_target is not None
+            and hasattr(batch, 'atar_slice_trigger_target') and batch.atar_slice_trigger_target is not None):
+        sp_role = batch.atar_slice_pdg_target.float()
+        st_role = batch.atar_slice_trigger_target.float().view(-1)
+        if sp_role.dim() == 2 and sp_role.size(1) >= 3 and sp_role.size(0) == st_role.size(0):
+            trig = st_role > 0.5
+            pion = sp_role[:, 0] > 0.5
+            muon = sp_role[:, 1] > 0.5
+            mip = sp_role[:, 2] > 0.5
+            role = torch.zeros(sp_role.size(0), dtype=torch.long, device=sp_role.device)
+            role[trig & (~pion) & muon] = 1
+            role[trig & (~pion) & (~muon) & mip] = 2
+            targets['tar_slice_role'] = role
+    elif hasattr(batch, 'atar_slice_role_target') and batch.atar_slice_role_target is not None:
+        targets['tar_slice_role'] = batch.atar_slice_role_target.long()
+    if hasattr(batch, 'dead_E_target') and batch.dead_E_target is not None:
+        targets['tar_dead_E'] = batch.dead_E_target.float().view(-1)
     
     x_all = batch.x if hasattr(batch, "x") else getattr(batch, "x_node", None)
     if x_all is None:
@@ -770,26 +900,41 @@ def format_targets_from_batch(batch):
         if num_graphs <= 0:
             return torch.zeros((int(n_slices),), dtype=torch.long, device=device)
 
-        # Preferred path for structured loader batches.
-        slice_graph_id = getattr(batch, "slice_graph_id", None)
-        if isinstance(slice_graph_id, torch.Tensor) and int(slice_graph_id.numel()) >= int(n_slices):
-            out = slice_graph_id.view(-1)[: int(n_slices)].to(device=device, dtype=torch.long)
-            return out.clamp(min=0, max=max(0, num_graphs - 1))
-
-        # Pointer-based fallback (also present in structured loader batches).
+        # These targets are ATAR-slice-level. The authoritative slice->graph mapping is
+        # atar_slice_ptr (one contiguous segment per graph over the ATAR slices). Prefer it
+        # whenever its total matches n_slices.
+        #
+        # Do NOT use slice_graph_id here unless it matches n_slices EXACTLY: slice_graph_id
+        # maps the GENERAL (graph_slice_ptr) slice grouping, which normally has a different
+        # count/order than ATAR slices (e.g. 90 general vs 22 ATAR). The old code used it
+        # whenever numel >= n_slices and truncated to the first n_slices entries, which
+        # scattered ATAR targets onto the wrong graphs and left most graphs with a zero
+        # target -> tar_angle_vec_per_graph norm ~0 -> loss_positron_angle pinned at ~1.0.
         atar_slice_ptr = getattr(batch, "atar_slice_ptr", None)
-        if isinstance(atar_slice_ptr, torch.Tensor) and int(atar_slice_ptr.numel()) >= 2:
-            ptr = atar_slice_ptr.view(-1).to(device=device, dtype=torch.long)
+
+        def _map_from_ptr(ptr_t: torch.Tensor) -> torch.Tensor:
+            ptr = ptr_t.view(-1).to(device=device, dtype=torch.long)
             out = torch.zeros((int(n_slices),), dtype=torch.long, device=device)
             g_max = min(max(0, num_graphs), int(ptr.numel()) - 1)
             for g in range(g_max):
-                s0 = int(ptr[g].item())
-                s1 = int(ptr[g + 1].item())
-                s0 = max(0, min(int(n_slices), s0))
-                s1 = max(0, min(int(n_slices), s1))
+                s0 = max(0, min(int(n_slices), int(ptr[g].item())))
+                s1 = max(0, min(int(n_slices), int(ptr[g + 1].item())))
                 if s1 > s0:
                     out[s0:s1] = g
             return out
+
+        if (isinstance(atar_slice_ptr, torch.Tensor) and int(atar_slice_ptr.numel()) >= 2
+                and int(atar_slice_ptr.view(-1)[-1].item()) == int(n_slices)):
+            return _map_from_ptr(atar_slice_ptr)
+
+        slice_graph_id = getattr(batch, "slice_graph_id", None)
+        if isinstance(slice_graph_id, torch.Tensor) and int(slice_graph_id.numel()) == int(n_slices):
+            out = slice_graph_id.view(-1).to(device=device, dtype=torch.long)
+            return out.clamp(min=0, max=max(0, num_graphs - 1))
+
+        # Loose pointer fallback (atar_slice_ptr present but total != n_slices: best effort).
+        if isinstance(atar_slice_ptr, torch.Tensor) and int(atar_slice_ptr.numel()) >= 2:
+            return _map_from_ptr(atar_slice_ptr)
 
         # Legacy PyG batch metadata fallback.
         out = torch.zeros((int(n_slices),), dtype=torch.long, device=device)

@@ -14,6 +14,7 @@ class BuildPurityGraphStage(BaseStage):
 
     name = "build_purity_graph"
     MAX_LYSO_OBJECTS = 20
+    LYSO_TRUTH_LINK_NS = 5.0  # truth-time single-linkage gap (ns) for LYSO object/trigger clustering
     PDG_PION = 1 << 0
     PDG_MUON = 1 << 1
     PDG_POSITRON = 1 << 2
@@ -41,6 +42,8 @@ class BuildPurityGraphStage(BaseStage):
         "atar_slice_pdg_target_out",
         "atar_slice_multi_target_out",
         "atar_slice_trigger_target_out",
+        "atar_slice_role_target_out",
+        "atar_triggering_pion_slice_out",
         "atar_slice_start_target_out",
         "atar_slice_stop_target_out",
         "atar_angle_target_out",
@@ -52,6 +55,7 @@ class BuildPurityGraphStage(BaseStage):
         "lyso_mask_target_out",
         "is_trigger_target_out",
         "has_trigger_positron_out",
+        "dead_E_target_out",
     )
 
     def __init__(
@@ -68,10 +72,17 @@ class BuildPurityGraphStage(BaseStage):
         lyso_time_norm: float = 500.0,
         cache_templates: bool | None = None,
         cache_max_entries: int | None = None,
+        build_edges: bool = False,
     ) -> None:
         self.input_state_key = str(input_state_key)
         self.node_feature_dim = int(node_feature_dim)
         self.edge_feature_dim = int(edge_feature_dim)
+        # The PURITY model recomputes its own physics edges in forward
+        # (physics_edge_index_batch), so the loader's complete-digraph edges are
+        # unused and O(n^2) in hits (the dominant loader memory term). Skip building
+        # them by default to bound memory; set build_edges=True only if a downstream
+        # consumer actually needs the loader-provided edges.
+        self.build_edges = bool(build_edges)
 
         self.atar_pos_norm = float(atar_pos_norm)
         self.atar_energy_norm = float(atar_energy_norm)
@@ -405,6 +416,8 @@ class BuildPurityGraphStage(BaseStage):
             state["atar_slice_pdg_target_out"] = np.zeros((0, 3), dtype=np.float32)
             state["atar_slice_multi_target_out"] = np.zeros((0,), dtype=np.float32)
             state["atar_slice_trigger_target_out"] = np.zeros((0,), dtype=np.float32)
+            state["atar_slice_role_target_out"] = np.zeros((0,), dtype=np.int64)
+            state["atar_triggering_pion_slice_out"] = np.zeros((0,), dtype=np.int64)
             state["atar_slice_start_target_out"] = np.zeros((0, 3), dtype=np.float32)
             state["atar_slice_stop_target_out"] = np.zeros((0, 3), dtype=np.float32)
             state["atar_angle_target_out"] = np.zeros((0, 3), dtype=np.float32)
@@ -415,6 +428,7 @@ class BuildPurityGraphStage(BaseStage):
             state["lyso_mask_target_out"] = np.zeros((0, self.MAX_LYSO_OBJECTS), dtype=np.float32)
             state["is_trigger_target_out"] = np.zeros((0,), dtype=np.float32)
             state["has_trigger_positron_out"] = np.zeros((0,), dtype=np.float32)
+            state["dead_E_target_out"] = np.zeros((0,), dtype=np.float32)
             return
 
         def ensure_row_offsets(offsets: np.ndarray) -> np.ndarray:
@@ -470,6 +484,12 @@ class BuildPurityGraphStage(BaseStage):
         lyso_z_vals, lyso_z_off = self._list_values_or_empty(store=chunk_in, field="lyso_z", dtype=np.float32)
         lyso_e_vals, lyso_e_off = self._list_values_or_empty(store=chunk_in, field="lyso_E", dtype=np.float32)
         lyso_t_vals, lyso_t_off = self._list_values_or_empty(store=chunk_in, field="lyso_t", dtype=np.float32)
+        # True (unsmeared) LYSO time for building time-coincident cluster targets. The
+        # observed lyso_t is energy-dependent-smeared (low-E hits drift many ns), so it is
+        # unreliable for grouping. Falls back to observed lyso_t if the column is absent.
+        lyso_truth_t_vals, lyso_truth_t_off = self._list_values_or_empty(store=chunk_in, field="lyso_truth_t", dtype=np.float32)
+        if int(lyso_truth_t_off[-1]) == 0 and int(lyso_t_off[-1]) > 0:
+            lyso_truth_t_vals, lyso_truth_t_off = lyso_t_vals, lyso_t_off
         lyso_slice_vals, lyso_slice_off = self._list_values_or_empty(store=chunk_in, field="lyso_slice", dtype=np.int32)
         if int(lyso_slice_off[-1]) == 0 and int(lyso_t_off[-1]) > 0:
             lyso_slice_vals, lyso_slice_off = self._zeros_for_offsets(ref_offsets=lyso_t_off, dtype=np.int32)
@@ -487,6 +507,7 @@ class BuildPurityGraphStage(BaseStage):
         event_id_values = self._scalar_values_or_none(store=chunk_in, field="event_id")
         target_signal = self._scalar_values_or_none(store=chunk_in, field="truth_is_signal")
         target_energy = self._scalar_values_or_none(store=chunk_in, field="truth_positron_energy")
+        dead_E_values = self._scalar_values_or_none(store=chunk_in, field="dead_E")
         truth_theta = self._scalar_values_or_none(store=chunk_in, field="truth_theta")
         truth_phi = self._scalar_values_or_none(store=chunk_in, field="truth_phi")
         truth_pion_stop_x = self._scalar_values_or_none(store=chunk_in, field="truth_pion_stop_x")
@@ -505,6 +526,24 @@ class BuildPurityGraphStage(BaseStage):
         lyso_origin_vals, lyso_origin_off = self._list_values_or_empty(store=chunk_in, field="lyso_origin", dtype=np.int64)
         if int(lyso_origin_off[-1]) == 0 and int(lyso_x_off[-1]) > 0:
             lyso_origin_vals, lyso_origin_off = self._zeros_for_offsets(ref_offsets=lyso_x_off, dtype=np.int64)
+        # lyso_pdg (purity mask bits) is needed to restrict the TRIGGER target to EM
+        # clusters (e+/e-/gamma); pi/mu calo deposits are clustered as objects but are
+        # never triggering signals.
+        lyso_pdg_vals, lyso_pdg_off = self._list_values_or_empty(store=chunk_in, field="lyso_pdg", dtype=np.int64)
+        if int(lyso_pdg_off[-1]) == 0 and int(lyso_x_off[-1]) > 0:
+            lyso_pdg_vals, lyso_pdg_off = self._zeros_for_offsets(ref_offsets=lyso_x_off, dtype=np.int64)
+        # lyso_is_trigger is the authoritative truth trigger target: 1 iff the hit's
+        # dominant track descends (Geant4 parentage) from the primary positron. The sim
+        # computes this with zero PDG/E/time heuristics; we consume it directly. Older
+        # parquet without the column falls back to the (origin==0 & EM) heuristic below.
+        lyso_is_trigger_vals, lyso_is_trigger_off = self._list_values_or_empty(
+            store=chunk_in, field="lyso_is_trigger", dtype=np.int64
+        )
+        has_lyso_is_trigger = int(lyso_is_trigger_off[-1]) > 0
+        if not has_lyso_is_trigger and int(lyso_x_off[-1]) > 0:
+            lyso_is_trigger_vals, lyso_is_trigger_off = self._zeros_for_offsets(
+                ref_offsets=lyso_x_off, dtype=np.int64
+            )
 
         # Normalize all list offsets to n_rows+1 so _row_slice is safe for optional
         # columns that are missing and represented with shape (1,) offsets.
@@ -527,6 +566,9 @@ class BuildPurityGraphStage(BaseStage):
         atar_origin_off = ensure_row_offsets(atar_origin_off)
         atar_truth_t_off = ensure_row_offsets(atar_truth_t_off)
         lyso_origin_off = ensure_row_offsets(lyso_origin_off)
+        lyso_pdg_off = ensure_row_offsets(lyso_pdg_off)
+        lyso_is_trigger_off = ensure_row_offsets(lyso_is_trigger_off)
+        lyso_truth_t_off = ensure_row_offsets(lyso_truth_t_off)
 
         include_targets = bool(getattr(owner, "include_targets", False))
         if include_targets and target_signal is None and target_energy is None:
@@ -569,6 +611,8 @@ class BuildPurityGraphStage(BaseStage):
         atar_slice_pdg_target_rows: list[np.ndarray] = []
         atar_slice_multi_target_rows: list[np.ndarray] = []
         atar_slice_trigger_target_rows: list[np.ndarray] = []
+        atar_slice_role_target_rows: list[np.ndarray] = []
+        atar_triggering_pion_slice_rows: list[int] = []
         atar_slice_start_target_rows: list[np.ndarray] = []
         atar_slice_stop_target_rows: list[np.ndarray] = []
         atar_angle_target_rows: list[np.ndarray] = []
@@ -578,6 +622,7 @@ class BuildPurityGraphStage(BaseStage):
         lyso_mask_target_rows: list[np.ndarray] = []
         positron_energy_target_rows: list[np.ndarray] = []
         has_trigger_positron_rows: list[float] = []
+        dead_E_target_rows: list[float] = []
         node_base = 0
         slice_base = 0
 
@@ -619,16 +664,21 @@ class BuildPurityGraphStage(BaseStage):
             if n_nodes <= 0:
                 continue
 
-            src_local, dst_local = self._complete_digraph_cached(
-                n_nodes,
-                cache_templates=cache_templates,
-                cache_max_entries=cache_max_entries,
-            )
-            edge_attr = self._build_purity_edge_attr(nodes, src_local, dst_local)
-
-            if src_local.size > 0:
-                edge_index = np.vstack([src_local + node_base, dst_local + node_base]).astype(np.int64, copy=False)
+            if self.build_edges:
+                src_local, dst_local = self._complete_digraph_cached(
+                    n_nodes,
+                    cache_templates=cache_templates,
+                    cache_max_entries=cache_max_entries,
+                )
+                edge_attr = self._build_purity_edge_attr(nodes, src_local, dst_local)
+                if src_local.size > 0:
+                    edge_index = np.vstack([src_local + node_base, dst_local + node_base]).astype(np.int64, copy=False)
+                else:
+                    edge_index = np.zeros((2, 0), dtype=np.int64)
             else:
+                # Model recomputes edges in forward; emit empty edge tensors (kept at
+                # edge_feature_dim so batching / shape contracts still hold).
+                edge_attr = np.zeros((0, self.edge_feature_dim), dtype=np.float32)
                 edge_index = np.zeros((2, 0), dtype=np.int64)
 
             node_blocks.append(nodes)
@@ -694,6 +744,31 @@ class BuildPurityGraphStage(BaseStage):
                 fill_value=-1,
                 dtype=np.int64,
             )
+            lyso_pdg_row = fit_length(
+                self._row_slice(lyso_pdg_vals, lyso_pdg_off, row_idx),
+                length=n_lyso,
+                fill_value=0,
+                dtype=np.int64,
+            )
+            lyso_truth_t_row = fit_length(
+                self._row_slice(lyso_truth_t_vals, lyso_truth_t_off, row_idx),
+                length=n_lyso,
+                fill_value=0.0,
+                dtype=np.float32,
+            )
+            lyso_is_trigger_row = fit_length(
+                self._row_slice(lyso_is_trigger_vals, lyso_is_trigger_off, row_idx),
+                length=n_lyso,
+                fill_value=0,
+                dtype=np.int64,
+            )
+            # EM hits (positron shower: e+/e-/gamma) — only used by the legacy fallback
+            # trigger heuristic when the sim did not emit the lyso_is_trigger truth column.
+            lyso_is_em = (
+                ((lyso_pdg_row & self.PDG_POSITRON) > 0)
+                | ((lyso_pdg_row & self.PDG_ELECTRON) > 0)
+                | ((lyso_pdg_row & self.PDG_GAMMA) > 0)
+            )
 
             atar_node_pdg_target = np.zeros((n_nodes, 3), dtype=np.float32)
             if n_atar > 0:
@@ -716,7 +791,27 @@ class BuildPurityGraphStage(BaseStage):
             if n_atar > 0:
                 is_trigger[:n_atar] = (atar_origin_row == 0).astype(np.float32, copy=False)
             if n_lyso > 0:
-                is_trigger[n_atar:] = (lyso_origin_row == 0).astype(np.float32, copy=False)
+                if has_lyso_is_trigger:
+                    # Authoritative truth target: the hit's dominant track descends from
+                    # the trigger positron (Geant4 parentage, computed in the sim). This
+                    # captures the full positron shower (e+ and ALL its daughters) and
+                    # excludes pi/mu deposits even when they carry origin==0 — no
+                    # PDG/E/time heuristic (Jack 2026-05-30).
+                    trig = lyso_is_trigger_row > 0
+                    # Restrict to the PROMPT truth-time cluster (within LYSO_TRUTH_LINK_NS of
+                    # the lineage median time). The positron shower is instantaneous (true
+                    # spread ~0.8ns); the only genuinely time-displaced lineage hits are the
+                    # rare late neutron-capture cascade (95% late, ~0.1% of lineage energy,
+                    # tens–hundreds ns out, in 1.8% of events). Dropping that tail keeps the
+                    # trigger one time-coincident object, consistent with the truth-time
+                    # clustering below (Jack 2026-05-31).
+                    if bool(trig.any()):
+                        t_core = float(np.median(lyso_truth_t_row[trig]))
+                        trig = trig & (np.abs(lyso_truth_t_row - t_core) <= self.LYSO_TRUTH_LINK_NS)
+                    is_trigger[n_atar:] = trig.astype(np.float32, copy=False)
+                else:
+                    # Legacy fallback for parquet without the truth column: origin==0 & EM.
+                    is_trigger[n_atar:] = ((lyso_origin_row == 0) & lyso_is_em).astype(np.float32, copy=False)
             is_trigger_target_blocks.append(is_trigger)
 
             lyso_fracs = np.zeros((n_nodes, self.MAX_LYSO_OBJECTS), dtype=np.float32)
@@ -747,23 +842,49 @@ class BuildPurityGraphStage(BaseStage):
                     fill_value=0.0,
                     dtype=np.float32,
                 )
-                unique_objs = np.unique(lyso_origin_row)
-                unique_objs = unique_objs[unique_objs >= 0]
-                n_objs_true = min(int(unique_objs.shape[0]), int(self.MAX_LYSO_OBJECTS))
-                for obj_idx in range(n_objs_true):
-                    obj_id = unique_objs[obj_idx]
-                    obj_mask = lyso_origin_row == obj_id
-                    lyso_fracs[n_atar:, obj_idx] = obj_mask.astype(np.float32, copy=False)
-                    lyso_mask[obj_idx] = 1.0
-                    e_sum = float(np.sum(lyso_e_row[obj_mask]))
-                    if e_sum > 0.0:
-                        cx = float(np.sum(lyso_x_row[obj_mask] * lyso_e_row[obj_mask]) / e_sum)
-                        cy = float(np.sum(lyso_y_row[obj_mask] * lyso_e_row[obj_mask]) / e_sum)
-                        cz = float(np.sum(lyso_z_row[obj_mask] * lyso_e_row[obj_mask]) / e_sum)
-                        lyso_payload[obj_idx, 0] = cx / self.lyso_pos_norm
-                        lyso_payload[obj_idx, 1] = cy / self.lyso_pos_norm
-                        lyso_payload[obj_idx, 2] = cz / self.lyso_pos_norm
-                        lyso_payload[obj_idx, 3] = e_sum / self.lyso_energy_norm
+                # Object-condensation targets clustered by TRUTH time (Jack 2026-05-31).
+                # The previous (origin, lyso_slice) grouping localized by the model's
+                # OBSERVED-time slice, which is energy-smeared (~8.5ns typical, low-E tail
+                # to ~386ns) and shattered the instantaneous positron shower (true spread
+                # ~0.8ns) across slices — 38% of triggering positrons fragmented into
+                # multiple objects (mean 1.46). Truth targets must be built from truth:
+                # single-linkage each beam-origin's hits in lyso_truth_t with a
+                # LYSO_TRUTH_LINK_NS gap. The prompt shower collapses to ONE object (99.3%
+                # of events); a genuinely time-separated same-origin deposit (the rare
+                # neutron-capture tail, ~0.1% of energy) correctly becomes its own object.
+                # (lyso_truth_t is signal-only but the origin>=0 hits are a verified 100%
+                # contiguous prefix, so it is aligned to exactly the hits clustered here.)
+                obj_idx = 0
+                sig_ids = np.unique(lyso_origin_row[lyso_origin_row >= 0])
+                for obj_id in sig_ids:
+                    if obj_idx >= self.MAX_LYSO_OBJECTS:
+                        break
+                    o_idx = np.nonzero(lyso_origin_row == obj_id)[0]
+                    if o_idx.size == 0:
+                        continue
+                    order = np.argsort(lyso_truth_t_row[o_idx], kind="stable")
+                    o_sorted = o_idx[order]
+                    tt_sorted = lyso_truth_t_row[o_sorted]
+                    splits = np.nonzero(np.diff(tt_sorted) > self.LYSO_TRUTH_LINK_NS)[0] + 1
+                    for grp in np.split(o_sorted, splits):
+                        if obj_idx >= self.MAX_LYSO_OBJECTS:
+                            break
+                        if grp.size == 0:
+                            continue
+                        cmask = np.zeros(n_lyso, dtype=bool)
+                        cmask[grp] = True
+                        lyso_fracs[n_atar:, obj_idx] = cmask.astype(np.float32, copy=False)
+                        lyso_mask[obj_idx] = 1.0
+                        e_sum = float(np.sum(lyso_e_row[cmask]))
+                        if e_sum > 0.0:
+                            cx = float(np.sum(lyso_x_row[cmask] * lyso_e_row[cmask]) / e_sum)
+                            cy = float(np.sum(lyso_y_row[cmask] * lyso_e_row[cmask]) / e_sum)
+                            cz = float(np.sum(lyso_z_row[cmask] * lyso_e_row[cmask]) / e_sum)
+                            lyso_payload[obj_idx, 0] = cx / self.lyso_pos_norm
+                            lyso_payload[obj_idx, 1] = cy / self.lyso_pos_norm
+                            lyso_payload[obj_idx, 2] = cz / self.lyso_pos_norm
+                            lyso_payload[obj_idx, 3] = e_sum / self.lyso_energy_norm
+                        obj_idx += 1
             lyso_fracs_target_blocks.append(lyso_fracs)
             lyso_payload_target_rows.append(lyso_payload)
             lyso_mask_target_rows.append(lyso_mask)
@@ -774,6 +895,10 @@ class BuildPurityGraphStage(BaseStage):
                     np.any((atar_origin_row == 0) & ((atar_pdg_row & self.PDG_POSITRON) > 0))
                 )
             has_trigger_positron_rows.append(has_trigger_positron)
+            if dead_E_values is not None and int(dead_E_values.shape[0]) > int(row_idx):
+                dead_E_target_rows.append(float(dead_E_values[row_idx]))
+            else:
+                dead_E_target_rows.append(0.0)
 
             if target_energy is not None and int(target_energy.shape[0]) > int(row_idx):
                 positron_energy_target_rows.append(np.asarray([float(target_energy[row_idx])], dtype=np.float32))
@@ -781,10 +906,13 @@ class BuildPurityGraphStage(BaseStage):
                 positron_energy_target_rows.append(np.asarray([0.0], dtype=np.float32))
 
             n_atar_slices = 0
+            anchor_idx = -1
             if n_atar > 0:
                 atar_slice_ids = nodes[:n_atar, 8].astype(np.int64, copy=False)
                 unique_atar_slices, atar_slice_inverse = np.unique(atar_slice_ids, return_inverse=True)
                 n_atar_slices = int(unique_atar_slices.shape[0])
+                cand_local_idxs: list[int] = []
+                cand_times: list[float] = []
 
                 atar_x_row = fit_length(
                     self._row_slice(atar_x_vals, atar_x_off, row_idx),
@@ -849,6 +977,23 @@ class BuildPurityGraphStage(BaseStage):
                         )
                     atar_slice_pdg_target_rows.append(s_pdg_out.reshape(1, 3))
 
+                    # V2 role-based trigger target for this slice: {0: none/pion-anchor, 1: muon, 2: mip/e+}.
+                    # Pion anchor slices carry role 0 (anchor identity is the triggering_pion_slice).
+                    has_trig_s = bool(np.any(trigger_mask))
+                    if has_trig_s and s_pdg_out[0] > 0.5:
+                        role = 0
+                    elif has_trig_s and s_pdg_out[1] > 0.5:
+                        role = 1
+                    elif has_trig_s and s_pdg_out[2] > 0.5:
+                        role = 2
+                    else:
+                        role = 0
+                    atar_slice_role_target_rows.append(np.asarray([role], dtype=np.int64))
+                    # Anchor candidate = trigger-origin pion slice; pick earliest slice mean time (node col 9 = raw ns).
+                    if has_trig_s and s_pdg_out[0] > 0.5:
+                        cand_local_idxs.append(int(local_slice_idx))
+                        cand_times.append(float(np.mean(nodes[:n_atar, 9][s_mask])))
+
                     if int(ref_idx.shape[0]) > 0:
                         s_t = atar_truth_t_row[ref_idx]
                         s_x = atar_x_row[ref_idx]
@@ -881,6 +1026,9 @@ class BuildPurityGraphStage(BaseStage):
                         stop_xyz = np.zeros((3,), dtype=np.float32)
                     atar_slice_start_target_rows.append(start_xyz.reshape(1, 3))
                     atar_slice_stop_target_rows.append(stop_xyz.reshape(1, 3))
+
+                if len(cand_local_idxs) > 0:
+                    anchor_idx = int(cand_local_idxs[int(np.argmin(np.asarray(cand_times)))])
 
                 theta_val = float(truth_theta[row_idx]) if truth_theta is not None and int(truth_theta.shape[0]) > int(row_idx) else 0.0
                 phi_val = float(truth_phi[row_idx]) if truth_phi is not None and int(truth_phi.shape[0]) > int(row_idx) else 0.0
@@ -919,6 +1067,7 @@ class BuildPurityGraphStage(BaseStage):
                         np.asarray([1.0 if pion_stop_valid else 0.0], dtype=np.float32)
                     )
             graph_atar_slice_counts.append(n_atar_slices)
+            atar_triggering_pion_slice_rows.append(int(anchor_idx))
 
             if include_targets:
                 if target_signal is not None:
@@ -1049,6 +1198,15 @@ class BuildPurityGraphStage(BaseStage):
         else:
             state["atar_slice_trigger_target_out"] = np.zeros((0,), dtype=np.float32)
 
+        if atar_slice_role_target_rows:
+            state["atar_slice_role_target_out"] = np.concatenate(atar_slice_role_target_rows, axis=0).astype(
+                np.int64, copy=False
+            )
+        else:
+            state["atar_slice_role_target_out"] = np.zeros((0,), dtype=np.int64)
+
+        state["atar_triggering_pion_slice_out"] = np.asarray(atar_triggering_pion_slice_rows, dtype=np.int64)
+
         if atar_slice_start_target_rows:
             state["atar_slice_start_target_out"] = np.concatenate(atar_slice_start_target_rows, axis=0).astype(
                 np.float32, copy=False
@@ -1090,6 +1248,7 @@ class BuildPurityGraphStage(BaseStage):
             state["positron_initial_energy_target_out"] = np.zeros((0, 1), dtype=np.float32)
 
         state["has_trigger_positron_out"] = np.asarray(has_trigger_positron_rows, dtype=np.float32)
+        state["dead_E_target_out"] = np.asarray(dead_E_target_rows, dtype=np.float32)
 
         if include_targets:
             y_graph = np.asarray(graph_targets, dtype=np.float32).reshape(-1, 1)

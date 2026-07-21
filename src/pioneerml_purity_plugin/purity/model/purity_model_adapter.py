@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+import math
 import warnings
 
 import torch
@@ -17,6 +18,15 @@ from pioneerml.integration.pytorch.models.architectures.graph.transformer.classi
 )
 
 from .purity_hybrid_model import PurityHybridModel
+from .utils.constants import (
+    NORM_POS_ATAR,
+    ACCEPT_Z_MIN_MM,
+    ACCEPT_Z_MAX_MM,
+    ACCEPT_XY_MAX_MM,
+    ACCEPT_ANGLE_MAX_DEG,
+)
+
+_ACCEPT_ANGLE_COS = math.cos(math.radians(ACCEPT_ANGLE_MAX_DEG))
 
 
 class _PurityExportAdapter(nn.Module):
@@ -170,8 +180,7 @@ class PurityModel(BaseGraphClassifierModel):
     """
     Adapter wrapper for the core `PurityHybridModel`.
 
-    The internal implementation mirrors:
-    `deprecated/omar_pioneerML/unified_reco/models.py`
+    The internal implementation mirrors the original `unified_reco/models.py`.
     """
 
     def __init__(
@@ -183,9 +192,14 @@ class PurityModel(BaseGraphClassifierModel):
         heads: int = 5,
         layers: int = 3,
         num_blocks: int | None = None,
-        dropout: float = 0.05,
+        dropout: float = 0.1,
         num_pdg_classes: int = 3,
-        use_teacher_forcing_gates: bool = True,
+        # V2 parity: train_purity.py defaults use_truth_positron_mask=False (opt-in CLI
+        # flag --truth_positron_mask). Standard V2 training never feeds the truth positron
+        # mask — the model uses its OWN predicted positron hits for the direction head, so
+        # train and inference match. Default off to match; teacher forcing the positron
+        # mask biases train vs val (exposure bias) and is NOT how V2 trains.
+        use_teacher_forcing_gates: bool = False,
     ):
         resolved_blocks = int(layers) if num_blocks is None else int(num_blocks)
         super().__init__(
@@ -201,13 +215,14 @@ class PurityModel(BaseGraphClassifierModel):
         self.num_pdg_classes = int(num_pdg_classes)
         self.use_teacher_forcing_gates = bool(use_teacher_forcing_gates)
 
+        # The v2 model is pure (no teacher-forcing ctor arg); the adapter keeps its
+        # own use_teacher_forcing_gates flag and derives teacher signals in forward.
         self.impl = PurityHybridModel(
             hidden_dim=int(hidden),
             num_blocks=int(resolved_blocks),
             heads=int(heads),
             dropout=float(dropout),
             num_pdg_classes=int(num_pdg_classes),
-            use_teacher_forcing_gates=bool(use_teacher_forcing_gates),
         )
 
     @staticmethod
@@ -360,15 +375,28 @@ class PurityModel(BaseGraphClassifierModel):
                             pos_energy = torch.zeros((b,), dtype=torch.float32, device=device)
                         pos_energy.index_add_(0, hit_graph[valid_vg], e_lyso * lyso_mask)
 
-        ps_raw = pion_stop * float(self.impl.norm_pos_atar)
+        ps_raw = pion_stop * float(NORM_POS_ATAR)
         fiducial = (
-            (ps_raw[:, 2] > float(self.impl.accept_z_min_mm))
-            & (ps_raw[:, 2] < float(self.impl.accept_z_max_mm))
-            & (ps_raw[:, 0].abs() < float(self.impl.accept_xy_max_mm))
-            & (ps_raw[:, 1].abs() < float(self.impl.accept_xy_max_mm))
+            (ps_raw[:, 2] > float(ACCEPT_Z_MIN_MM))
+            & (ps_raw[:, 2] < float(ACCEPT_Z_MAX_MM))
+            & (ps_raw[:, 0].abs() < float(ACCEPT_XY_MAX_MM))
+            & (ps_raw[:, 1].abs() < float(ACCEPT_XY_MAX_MM))
         )
-        angle_ok = positron_dir[:, 2] > float(self.impl.accept_angle_cos)
-        accepted = (fiducial & angle_ok).to(dtype=torch.float32)
+        angle_ok = positron_dir[:, 2] > float(_ACCEPT_ANGLE_COS)
+        # Mirror the model's event_summary acceptance gate (purity_hybrid_model.py:1829-1833,
+        # == models_v2.py:1305-1309): acceptance requires a trigger positron, not just
+        # fiducial+angle. The exported summary_accepted must equal event_summary['accepted'].
+        htp_rule = outputs.get("has_trigger_positron_rule")
+        if htp_rule is not None:
+            htp_rule = htp_rule.to(dtype=torch.float32, device=device).view(-1)
+            if int(htp_rule.size(0)) < b:
+                pad = torch.zeros((b - int(htp_rule.size(0)),), dtype=torch.float32, device=device)
+                htp_rule = torch.cat([htp_rule, pad], dim=0)
+            elif int(htp_rule.size(0)) > b:
+                htp_rule = htp_rule[:b]
+            accepted = (fiducial & angle_ok & (htp_rule > 0.5)).to(dtype=torch.float32)
+        else:
+            accepted = (fiducial & angle_ok).to(dtype=torch.float32)
 
         outputs["summary_accepted"] = accepted
         outputs["summary_positron_energy"] = pos_energy
@@ -394,22 +422,37 @@ class PurityModel(BaseGraphClassifierModel):
                 "w_positron_angle": 1.0,
                 "w_lyso_condensation": 0.5,
             }
-        teacher_is_trigger: torch.Tensor | None = None
-        teacher_node_pdg: torch.Tensor | None = None
-        if self.training and self.use_teacher_forcing_gates and isinstance(data, Data):
-            maybe_trigger = getattr(data, "is_trigger_target", None)
-            if isinstance(maybe_trigger, torch.Tensor):
-                teacher_is_trigger = maybe_trigger
-            maybe_node_pdg = getattr(data, "atar_node_pdg_target", None)
-            if isinstance(maybe_node_pdg, torch.Tensor):
-                teacher_node_pdg = maybe_node_pdg
+        # V2 takes (triggering_pion_slice, truth_positron_mask), but standard V2 training
+        # passes truth_positron_mask=None (the --truth_positron_mask flag defaults off).
+        truth_positron_mask: torch.Tensor | None = None
+        triggering_pion_slice: torch.Tensor | None = None
+        if isinstance(data, Data):
+            # The triggering-pion slice is FREE at inference time: the trigger fires on
+            # that pion, so the DAQ already knows which ATAR time-slice it occupies.
+            # Provide it ALWAYS (train AND eval) — it is a real system input, not truth
+            # leakage. This matches V2, which passes the anchor unconditionally. Withholding
+            # it in eval makes the model fall back to a heuristic earliest-predicted-pion
+            # anchor (see purity_hybrid_model.py ~L1086) and the ENTIRE role chain
+            # (pion->muon->positron) is built relative to that guess.
+            maybe_anchor = getattr(data, "atar_triggering_pion_slice", None)
+            if isinstance(maybe_anchor, torch.Tensor) and maybe_anchor.numel() > 0:
+                triggering_pion_slice = maybe_anchor.to(dtype=torch.long).view(-1)
+            # The positron mask, by contrast, IS reconstruction truth (the positron only
+            # appears later, from the muon decay, and finding its hits is the task). V2
+            # does NOT teacher-force it by default (use_teacher_forcing_gates defaults
+            # False); feeding it biases train vs val. Kept only as an opt-in parity knob.
+            if self.training and self.use_teacher_forcing_gates:
+                maybe_trigger = getattr(data, "is_trigger_target", None)
+                maybe_node_pdg = getattr(data, "atar_node_pdg_target", None)
+                if isinstance(maybe_trigger, torch.Tensor) and isinstance(maybe_node_pdg, torch.Tensor):
+                    truth_positron_mask = (maybe_trigger > 0.5) & (maybe_node_pdg[:, 2] > 0.5)
 
         outputs = self.impl(
             x,
             batch,
             task_weights=task_weights,
-            teacher_is_trigger=teacher_is_trigger,
-            teacher_node_pdg=teacher_node_pdg,
+            triggering_pion_slice=triggering_pion_slice,
+            truth_positron_mask=truth_positron_mask,
         )
         if not self.training:
             outputs = self._attach_inference_summary(outputs=outputs, x=x, batch=batch)
