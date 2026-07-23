@@ -7,6 +7,7 @@ venv/
 build/
 dist/
 *.egg-info/
+src/pioneerml_purity_plugin/purity/loader/native/*.so
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/

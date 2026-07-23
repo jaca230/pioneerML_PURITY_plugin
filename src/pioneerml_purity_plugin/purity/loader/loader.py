@@ -20,12 +20,17 @@ from pioneerml.data_loader.loaders.stage.stages import (
 from pioneerml.staged_runtime.stage_observers import StageObserver
 
 from .multi_level_graph_loader import MultiLevelGraphLoader
-from .stages import BuildPurityGraphStage, PurityRowGuardStage
+from .stages import (
+    BuildPurityGraphStage,
+    NativePurityInferenceGraphStage,
+    OptimizedPythonPurityInferenceGraphStage,
+    PurityRowGuardStage,
+)
 
 
 @LOADER_REGISTRY.register("purity")
 class PurityGraphLoader(MultiLevelGraphLoader):
-    """Structured staged loader for Omar-style PURITY event parquet."""
+    """Structured staged loader for PURITY event parquet."""
 
     NODE_FEATURE_DIM = 10
     EDGE_FEATURE_DIM = 11
@@ -41,9 +46,36 @@ class PurityGraphLoader(MultiLevelGraphLoader):
         data_flow_config: DataFlowConfig,
         split_config: SplitSampleConfig,
         loader_params: dict[str, Any] | None = None,
+        graph_builder_backend: str = "standard",
     ):
         params = dict(loader_params or {})
         stage_overrides = params.get("stage_overrides")
+        graph_builder_backend = str(graph_builder_backend).strip().lower()
+        if graph_builder_backend not in {"standard", "python_optimized", "cpp"}:
+            raise ValueError(
+                "graph_builder_backend must be one of: standard, python_optimized, cpp"
+            )
+        if graph_builder_backend != "standard":
+            if str(mode).strip().lower() != str(cls.MODE_INFERENCE).lower():
+                raise ValueError(f"{graph_builder_backend} graph builder supports inference only")
+            stage_cls = (
+                OptimizedPythonPurityInferenceGraphStage
+                if graph_builder_backend == "python_optimized"
+                else NativePurityInferenceGraphStage
+            )
+            resolved_overrides = dict(stage_overrides or {})
+            resolved_overrides["build_purity_graph"] = stage_cls(
+                input_state_key="features_in",
+                node_feature_dim=int(cls.NODE_FEATURE_DIM),
+                edge_feature_dim=int(cls.EDGE_FEATURE_DIM),
+                atar_pos_norm=float(params.get("atar_pos_norm", 10.0)),
+                atar_energy_norm=float(params.get("atar_energy_norm", 1.0)),
+                atar_time_norm=float(params.get("atar_time_norm", 500.0)),
+                lyso_pos_norm=float(params.get("lyso_pos_norm", 100.0)),
+                lyso_energy_norm=float(params.get("lyso_energy_norm", 70.0)),
+                lyso_time_norm=float(params.get("lyso_time_norm", 500.0)),
+            )
+            stage_overrides = resolved_overrides
         stage_observer = params.get("stage_observer")
         profiling = dict(params.get("profiling") or {})
         loader = cls(
