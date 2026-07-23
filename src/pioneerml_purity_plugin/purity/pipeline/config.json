@@ -561,6 +561,12 @@
       "runtime": {
         "prefer_cuda": false
       },
+      "batch_executor": {
+        "type": "purity",
+        "config": {
+          "error_policy": "mark_batch"
+        }
+      },
       "writer": {
         "type": "purity",
         "config": {

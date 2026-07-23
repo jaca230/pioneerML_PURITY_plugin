@@ -78,6 +78,7 @@ class MultiLevelGraphLoader(GraphLoader):
 
     def _slice_chunk_batch(self, chunk: dict, g0: int, g1: int):
         d = super()._slice_chunk_batch(chunk, g0, g1)
+        num_graphs = int(g1 - g0)
 
         node_ptr = chunk["node_ptr"]
         n0 = int(node_ptr[g0].item())

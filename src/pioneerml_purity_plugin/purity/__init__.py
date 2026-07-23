@@ -5,6 +5,7 @@ from .evaluation import (
     plot_purity_phase_3_loss_curves,
     plot_purity_staged_loss_curves,
 )
+from .inference import PurityInferenceBatchExecutor
 from .loader import PurityGraphLoader
 from .losses import PurityUnifiedLoss
 from .model_handle import PurityEagerModelHandle
@@ -20,6 +21,7 @@ __all__ = [
     "PurityUnifiedLoss",
     "PurityMultiLevelLightningModule",
     "PurityMultiLevelEvaluator",
+    "PurityInferenceBatchExecutor",
     "plot_purity_staged_loss_curves",
     "plot_purity_phase_1_loss_curves",
     "plot_purity_phase_2_loss_curves",
