@@ -115,7 +115,6 @@ class PurityDataWriter(TimeGroupGraphDataWriter):
                 output_column(
                     "event_id",
                     value_type=pa.int64(),
-                    metadata={"pioneer.role": "alignment"},
                 ),
                 output_column(
                     "time_group_ids",
